@@ -93,8 +93,8 @@ case "$OS_UNAME" in
         EXT="tar.gz"
         ;;
     Darwin)
-        TARGET_OS="apple-darwin"
-        EXT="tar.gz"
+        log_error "Prebuilt macOS binaries are not provided. Please build from source using 'cargo build --release'."
+        exit 1
         ;;
     MINGW*|MSYS*|CYGWIN*)
         TARGET_OS="pc-windows-msvc"

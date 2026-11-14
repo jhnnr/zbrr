@@ -343,7 +343,16 @@ impl Database {
             r#"
             SELECT * FROM releases
             WHERE state IN ('DISCOVERED', 'DUPE_CHECKED', 'DOWNLOADING', 'PACKAGING', 'UPLOADING')
-            ORDER BY id ASC
+            ORDER BY
+                CASE state
+                    WHEN 'UPLOADING' THEN 1
+                    WHEN 'PACKAGING' THEN 2
+                    WHEN 'DOWNLOADING' THEN 3
+                    WHEN 'DUPE_CHECKED' THEN 4
+                    WHEN 'DISCOVERED' THEN 5
+                    ELSE 6
+                END ASC,
+                id ASC
             LIMIT ?1
             "#,
         )?;
@@ -529,6 +538,78 @@ impl Database {
         Ok(total_unskipped)
     }
 
+    /// Finds the earliest actionable release (e.g. Episode 01 or batch) for an anime.
+    pub fn find_earliest_actionable_release_for_anime(
+        &self,
+        clean_title: &str,
+        mal_id: Option<u64>,
+    ) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        // 1. Check by MAL ID if present
+        if let Some(mid) = mal_id {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT * FROM releases
+                WHERE state IN ('DISCOVERED', 'DUPE_CHECKED', 'DOWNLOADING', 'PACKAGING', 'UPLOADING')
+                  AND mal_id = ?1
+                ORDER BY
+                    CASE state
+                        WHEN 'UPLOADING' THEN 1
+                        WHEN 'PACKAGING' THEN 2
+                        WHEN 'DOWNLOADING' THEN 3
+                        WHEN 'DUPE_CHECKED' THEN 4
+                        WHEN 'DISCOVERED' THEN 5
+                        ELSE 6
+                    END ASC,
+                    id ASC
+                LIMIT 1
+                "#,
+            )?;
+            let mut rows = stmt.query_map(params![mid as i64], Self::map_row)?;
+            if let Some(row) = rows.next() {
+                return Ok(Some(row?));
+            }
+        }
+
+        // 2. Check by normalized prefix
+        if !norm_prefix.is_empty() {
+            let like_pat = format!("{norm_prefix}%");
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT * FROM releases
+                WHERE state IN ('DISCOVERED', 'DUPE_CHECKED', 'DOWNLOADING', 'PACKAGING', 'UPLOADING')
+                  AND normalized_key LIKE ?1
+                ORDER BY
+                    CASE state
+                        WHEN 'UPLOADING' THEN 1
+                        WHEN 'PACKAGING' THEN 2
+                        WHEN 'DOWNLOADING' THEN 3
+                        WHEN 'DUPE_CHECKED' THEN 4
+                        WHEN 'DISCOVERED' THEN 5
+                        ELSE 6
+                    END ASC,
+                    id ASC
+                LIMIT 1
+                "#,
+            )?;
+            let mut rows = stmt.query_map(params![like_pat], Self::map_row)?;
+            if let Some(row) = rows.next() {
+                return Ok(Some(row?));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRecord> {
         let state_str: String = row.get("state")?;
         let state = ReleaseState::from_str(&state_str).unwrap_or(ReleaseState::Failed);
@@ -663,6 +744,11 @@ mod tests {
         let rec3_unskipped = db.get_release_by_id(id3)?.unwrap();
         assert_eq!(rec3_unskipped.state, ReleaseState::Discovered);
         assert!(rec3_unskipped.error_message.is_none());
+
+        // Test finding earliest actionable release for anime
+        let earliest = db.find_earliest_actionable_release_for_anime("Frieren", Some(52991))?;
+        assert!(earliest.is_some());
+        assert_eq!(earliest.unwrap().id, id3);
 
         Ok(())
     }

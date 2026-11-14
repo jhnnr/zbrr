@@ -258,25 +258,25 @@ impl Pipeline {
                     "Ongoing episode N > 1 requires catch-up; searching Prowlarr for missing prior episodes..."
                 );
 
-                let missing_queued = match self
+                let queued_ids = match self
                     .search_and_queue_missing_prior_episodes(&parsed, mal_id)
                     .await
                 {
-                    Ok(count) => count,
+                    Ok(ids) => ids,
                     Err(e) => {
                         warn!(
                             error = %e,
                             title = %record.raw_title,
                             "Failed searching Prowlarr for missing prior episodes"
                         );
-                        0
+                        Vec::new()
                     }
                 };
 
-                let skip_reason = if missing_queued > 0 {
+                let skip_reason = if !queued_ids.is_empty() {
                     format!(
                         "Ongoing catch-up queued: Discovered and queued {} missing prior episode(s)/batch from Prowlarr; Episode {:?} will automatically unskip once sequence is caught up",
-                        missing_queued,
+                        queued_ids.len(),
                         parsed.episode
                     )
                 } else {
@@ -285,6 +285,50 @@ impl Pipeline {
 
                 let db_skip = self.db.clone();
                 tokio::task::spawn_blocking(move || db_skip.mark_skipped(id, &skip_reason)).await??;
+
+                // Immediately find and advance the earliest actionable release (Episode 01 or batch) to download
+                let db_find = self.db.clone();
+                let clean_title = parsed.clean_title.clone();
+                let earliest_rec = tokio::task::spawn_blocking(move || {
+                    db_find.find_earliest_actionable_release_for_anime(&clean_title, mal_id)
+                })
+                .await??;
+
+                if let Some(starter_rec) = earliest_rec {
+                    let starter_id = starter_rec.id;
+                    let starter_title = starter_rec.raw_title.clone();
+                    let starter_parsed = starter_rec.parsed().ok();
+                    let is_starter = starter_parsed.as_ref().map_or(false, |p| {
+                        p.episode.map_or(false, |ep| ep <= 1) || p.is_season_pack
+                    });
+
+                    if is_starter {
+                        info!(
+                            starter_id = starter_id,
+                            parent_id = id,
+                            title = %starter_title,
+                            "Immediately advancing missing catch-up release (Episode 01/batch) to download"
+                        );
+                        if let Err(e) = Box::pin(self.advance_release(starter_rec, dry_run)).await {
+                            let err_msg = format!("{e:#}");
+                            warn!(
+                                starter_id = starter_id,
+                                title = %starter_title,
+                                error = %err_msg,
+                                "Failed advancing catch-up release; marking FAILED in SQLite"
+                            );
+                            let db_err = self.db.clone();
+                            let _ = tokio::task::spawn_blocking(move || db_err.mark_failed(starter_id, &err_msg)).await;
+                        }
+                    } else {
+                        info!(
+                            earliest_id = starter_id,
+                            title = %starter_title,
+                            "Queued catch-up releases require prior episodes; waiting for earlier sequence"
+                        );
+                    }
+                }
+
                 return Ok(());
             }
 
@@ -530,15 +574,15 @@ impl Pipeline {
         &self,
         parsed: &ParsedRelease,
         _mal_id: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<Vec<i64>> {
         let target_ep = match parsed.episode {
             Some(ep) if ep > 1 => ep,
-            _ => return Ok(0),
+            _ => return Ok(Vec::new()),
         };
 
         let raw_candidates = self.prowlarr.search_missing_prior_episodes(parsed).await?;
         if raw_candidates.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let target_norm = crate::dupe_checker::normalize_alnum(&parsed.clean_title);
@@ -642,7 +686,7 @@ impl Pipeline {
             }
         }
 
-        let mut queued_count = 0;
+        let mut queued_ids = Vec::new();
         for (item, cand_parsed) in to_queue {
             let db_ins = self.db.clone();
             let item_clone = item.clone();
@@ -660,10 +704,10 @@ impl Pipeline {
                 is_batch = cand_parsed.is_season_pack,
                 "Queued missing prior catch-up release in DISCOVERED state"
             );
-            queued_count += 1;
+            queued_ids.push(new_id);
         }
 
-        Ok(queued_count)
+        Ok(queued_ids)
     }
 
     fn reconstruct_bundle_from_record(&self, record: &ReleaseRecord) -> Result<PackageBundle> {
