@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::dupe_checker::DupeChecker;
 use crate::flaresolverr::FlareSolverrClient;
-use crate::models::{DiscoveredRelease, PackageBundle, ReleaseRecord, ReleaseState};
+use crate::models::{DiscoveredRelease, PackageBundle, ParsedRelease, ReleaseRecord, ReleaseState};
 use crate::packager::Packager;
 use crate::parser::{parse_anime_release, JikanResolver};
 use crate::prowlarr::ProwlarrClient;
@@ -255,10 +255,36 @@ impl Pipeline {
                     id = id,
                     title = %record.raw_title,
                     reason = %catchup_reason,
-                    "Skipping mid-season ongoing episode to comply with AnimeZ catch-up rules"
+                    "Ongoing episode N > 1 requires catch-up; searching Prowlarr for missing prior episodes..."
                 );
+
+                let missing_queued = match self
+                    .search_and_queue_missing_prior_episodes(&parsed, mal_id)
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            title = %record.raw_title,
+                            "Failed searching Prowlarr for missing prior episodes"
+                        );
+                        0
+                    }
+                };
+
+                let skip_reason = if missing_queued > 0 {
+                    format!(
+                        "Ongoing catch-up queued: Discovered and queued {} missing prior episode(s)/batch from Prowlarr; Episode {:?} will automatically unskip once sequence is caught up",
+                        missing_queued,
+                        parsed.episode
+                    )
+                } else {
+                    format!("{catchup_reason} (Prowlarr search found no prior episodes or batches)")
+                };
+
                 let db_skip = self.db.clone();
-                tokio::task::spawn_blocking(move || db_skip.mark_skipped(id, &catchup_reason)).await??;
+                tokio::task::spawn_blocking(move || db_skip.mark_skipped(id, &skip_reason)).await??;
                 return Ok(());
             }
 
@@ -477,9 +503,167 @@ impl Pipeline {
                 dry_run = upload_res.dry_run,
                 "Release successfully transitioned to SEEDING state"
             );
+
+            // Automatically un-skip any subsequent episodes for this anime that were waiting for catch-up
+            let db_unskip = self.db.clone();
+            let clean_title = parsed.clean_title.clone();
+            let unskipped = tokio::task::spawn_blocking(move || {
+                db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id)
+            })
+            .await??;
+
+            if unskipped > 0 {
+                info!(
+                    anime = %parsed.clean_title,
+                    unskipped = unskipped,
+                    "Un-skipped subsequent episode(s) now that required upload sequence is established"
+                );
+            }
         }
 
         Ok(())
+    }
+
+    /// Searches Prowlarr for missing prior episodes or batches for an ongoing anime series
+    /// when ZBRR_ANIMEZ_ENFORCE_ONGOING_CATCHUP is enabled, and queues them in DISCOVERED state.
+    async fn search_and_queue_missing_prior_episodes(
+        &self,
+        parsed: &ParsedRelease,
+        _mal_id: Option<u64>,
+    ) -> Result<usize> {
+        let target_ep = match parsed.episode {
+            Some(ep) if ep > 1 => ep,
+            _ => return Ok(0),
+        };
+
+        let raw_candidates = self.prowlarr.search_missing_prior_episodes(parsed).await?;
+        if raw_candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let target_norm = crate::dupe_checker::normalize_alnum(&parsed.clean_title);
+        let target_season = parsed.season.unwrap_or(1);
+        let target_res = parsed.resolution.as_deref().unwrap_or("1080p");
+
+        let mut batch_candidates: Vec<(DiscoveredRelease, ParsedRelease)> = Vec::new();
+        let mut episode_candidates: std::collections::HashMap<u32, (DiscoveredRelease, ParsedRelease)> =
+            std::collections::HashMap::new();
+
+        for item in raw_candidates {
+            let cand_parsed = parse_anime_release(&item.title);
+
+            // 1. Check AnimeZ upload rules compliance
+            if crate::parser::check_animez_rule_compliance(&cand_parsed).is_err() {
+                continue;
+            }
+
+            // 2. Check Prowlarr filters (e.g. min seeders, link validity)
+            if self.prowlarr.check_filters(&item, &cand_parsed).is_err() {
+                continue;
+            }
+
+            // 3. Verify clean title matches
+            let cand_norm = crate::dupe_checker::normalize_alnum(&cand_parsed.clean_title);
+            if cand_norm.is_empty()
+                || (cand_norm != target_norm
+                    && !cand_norm.contains(&target_norm)
+                    && !target_norm.contains(&cand_norm))
+            {
+                continue;
+            }
+
+            // 4. Verify season matches
+            let cand_season = cand_parsed.season.unwrap_or(1);
+            if cand_season != target_season {
+                continue;
+            }
+
+            // 5. Match release group if current release has one
+            if let Some(ref target_grp) = parsed.release_group {
+                if let Some(ref cand_grp) = cand_parsed.release_group {
+                    if !cand_grp.eq_ignore_ascii_case(target_grp) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            // 6. Match resolution if available
+            if let Some(ref cand_res) = cand_parsed.resolution {
+                if !cand_res.eq_ignore_ascii_case(target_res) {
+                    continue;
+                }
+            }
+
+            // 7. Check if already tracked in SQLite
+            let db_check = self.db.clone();
+            let guid = item.guid.clone();
+            let info_hash = item.info_hash.clone();
+            let norm_key = cand_parsed.normalized_key.clone();
+            let is_dupe = tokio::task::spawn_blocking(move || {
+                db_check.is_duplicate_in_db(&guid, info_hash.as_deref(), &norm_key)
+            })
+            .await??;
+
+            if is_dupe {
+                continue;
+            }
+
+            // 8. Classify as batch or prior single episode
+            if cand_parsed.is_season_pack {
+                batch_candidates.push((item, cand_parsed));
+            } else if let Some(cand_ep) = cand_parsed.episode {
+                if cand_ep < target_ep && cand_ep >= 1 {
+                    // Keep candidate with highest seeders for this episode
+                    match episode_candidates.get(&cand_ep) {
+                        Some((existing_item, _)) if existing_item.seeders >= item.seeders => {}
+                        _ => {
+                            episode_candidates.insert(cand_ep, (item, cand_parsed));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut to_queue: Vec<(DiscoveredRelease, ParsedRelease)> = Vec::new();
+
+        // If a batch candidate exists, prioritize it
+        if let Some((best_batch_item, best_batch_parsed)) =
+            batch_candidates.into_iter().max_by_key(|(i, _)| i.seeders)
+        {
+            to_queue.push((best_batch_item, best_batch_parsed));
+        } else {
+            // Sort single episodes in ascending sequence order: 1, 2, ... target_ep - 1
+            let mut sorted_eps: Vec<_> = episode_candidates.into_iter().collect();
+            sorted_eps.sort_by_key(|(ep, _)| *ep);
+            for (_, pair) in sorted_eps {
+                to_queue.push(pair);
+            }
+        }
+
+        let mut queued_count = 0;
+        for (item, cand_parsed) in to_queue {
+            let db_ins = self.db.clone();
+            let item_clone = item.clone();
+            let cand_clone = cand_parsed.clone();
+
+            let new_id = tokio::task::spawn_blocking(move || {
+                db_ins.insert_discovered(&item_clone, &cand_clone)
+            })
+            .await??;
+
+            info!(
+                id = new_id,
+                title = %item.title,
+                ep = ?cand_parsed.episode,
+                is_batch = cand_parsed.is_season_pack,
+                "Queued missing prior catch-up release in DISCOVERED state"
+            );
+            queued_count += 1;
+        }
+
+        Ok(queued_count)
     }
 
     fn reconstruct_bundle_from_record(&self, record: &ReleaseRecord) -> Result<PackageBundle> {

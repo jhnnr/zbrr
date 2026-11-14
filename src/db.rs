@@ -471,6 +471,64 @@ impl Database {
         Ok(false)
     }
 
+    /// Un-skips any releases for an anime that were previously postponed due to the ongoing catch-up rule.
+    pub fn unskip_catchup_releases_for_anime(
+        &self,
+        clean_title: &str,
+        mal_id: Option<u64>,
+    ) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let mut total_unskipped = 0;
+
+        // 1. Un-skip by MAL ID if present
+        if let Some(mid) = mal_id {
+            let count = conn.execute(
+                r#"
+                UPDATE releases
+                SET state = 'DISCOVERED',
+                    error_message = NULL,
+                    updated_at = ?1
+                WHERE state = 'SKIPPED'
+                  AND error_message LIKE '%catch-up%'
+                  AND mal_id = ?2
+                "#,
+                params![now, mid as i64],
+            )?;
+            total_unskipped += count;
+        }
+
+        // 2. Un-skip by normalized title prefix if present
+        if !norm_prefix.is_empty() {
+            let like_pat = format!("{norm_prefix}%");
+            let count = conn.execute(
+                r#"
+                UPDATE releases
+                SET state = 'DISCOVERED',
+                    error_message = NULL,
+                    updated_at = ?1
+                WHERE state = 'SKIPPED'
+                  AND error_message LIKE '%catch-up%'
+                  AND normalized_key LIKE ?2
+                "#,
+                params![now, like_pat],
+            )?;
+            total_unskipped += count;
+        }
+
+        Ok(total_unskipped)
+    }
+
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRecord> {
         let state_str: String = row.get("state")?;
         let state = ReleaseState::from_str(&state_str).unwrap_or(ReleaseState::Failed);
@@ -569,6 +627,42 @@ mod tests {
         assert!(!db.has_prior_upload_for_anime("Frieren", Some(52991), Some(1))?);
         db.set_seeding(id, Some("https://animez.to/torrents/123"))?;
         assert!(db.has_prior_upload_for_anime("Frieren", Some(52991), Some(1))?);
+
+        // Test un-skipping catch-up releases
+        let disc3 = DiscoveredRelease {
+            guid: "https://nyaa.si/view/123458".to_string(),
+            title: "[SubsPlease] Frieren - 03 (1080p) [ABCD1236].mkv".to_string(),
+            indexer_id: 1,
+            indexer_name: "Nyaa".to_string(),
+            download_url: Some("https://nyaa.si/download/123458.torrent".to_string()),
+            magnet_url: None,
+            info_hash: Some("abcdef1234567890abcdef1234567890abcdef14".to_string()),
+            size_bytes: 1_400_000_000,
+            seeders: 50,
+            leechers: 2,
+            publish_date: Some(Utc::now()),
+        };
+        let parsed3 = ParsedRelease {
+            raw_title: disc3.title.clone(),
+            clean_title: "Frieren".to_string(),
+            normalized_key: "frieren|s01e03|1080p|subsplease".to_string(),
+            release_group: Some("SubsPlease".to_string()),
+            season: Some(1),
+            episode: Some(3),
+            resolution: Some("1080p".to_string()),
+            ..Default::default()
+        };
+        let id3 = db.insert_discovered(&disc3, &parsed3)?;
+        db.set_dupe_checked(id3, Some(52991))?;
+        db.mark_skipped(id3, "AnimeZ catch-up required: missing prior episodes")?;
+        let rec3 = db.get_release_by_id(id3)?.unwrap();
+        assert_eq!(rec3.state, ReleaseState::Skipped);
+
+        let unskipped = db.unskip_catchup_releases_for_anime("Frieren", Some(52991))?;
+        assert_eq!(unskipped, 1);
+        let rec3_unskipped = db.get_release_by_id(id3)?.unwrap();
+        assert_eq!(rec3_unskipped.state, ReleaseState::Discovered);
+        assert!(rec3_unskipped.error_message.is_none());
 
         Ok(())
     }

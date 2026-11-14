@@ -250,7 +250,7 @@ impl DupeChecker {
     }
 }
 
-fn normalize_alnum(s: &str) -> String {
+pub fn normalize_alnum(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())

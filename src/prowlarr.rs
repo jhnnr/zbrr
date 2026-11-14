@@ -8,7 +8,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct ProwlarrClient {
     http: Client,
@@ -493,6 +493,101 @@ impl ProwlarrClient {
             .collect())
     }
 
+    /// Builds search queries for missing prior episodes in order of specificity.
+    pub fn build_missing_episodes_queries(parsed: &ParsedRelease) -> Vec<String> {
+        let group_str = parsed.release_group.as_deref().unwrap_or("").trim();
+        let res_str = parsed.resolution.as_deref().unwrap_or("").trim();
+
+        let mut queries = Vec::new();
+        // 1. Most specific: Title + Group + Resolution (e.g. "Marronnier Erai-raws 1080p")
+        if !group_str.is_empty() && !res_str.is_empty() {
+            queries.push(format!("{} {} {}", parsed.clean_title, group_str, res_str));
+        }
+        // 2. Specific: Title + Group
+        if !group_str.is_empty() {
+            queries.push(format!("{} {}", parsed.clean_title, group_str));
+        }
+        // 3. Title alone
+        queries.push(parsed.clean_title.clone());
+        // 4. Batch query
+        if !group_str.is_empty() {
+            queries.push(format!("{} {} batch", parsed.clean_title, group_str));
+        } else {
+            queries.push(format!("{} batch", parsed.clean_title));
+        }
+
+        queries
+    }
+
+    /// Searches configured Prowlarr source indexers for missing prior episodes or batches of an ongoing anime.
+    pub async fn search_missing_prior_episodes(
+        &self,
+        parsed: &ParsedRelease,
+    ) -> Result<Vec<DiscoveredRelease>> {
+        let base = self.config.prowlarr.url.trim_end_matches('/');
+        let url = format!("{base}/api/v1/search");
+        let source_ids = self.resolve_source_indexer_ids().await?;
+
+        let queries = Self::build_missing_episodes_queries(parsed);
+        let mut candidates = Vec::new();
+        let mut seen_guids = std::collections::HashSet::new();
+
+        for q in queries {
+            self.config.polite_sleep().await;
+            debug!(query = %q, "Searching Prowlarr source indexers for missing ongoing episodes");
+
+            let mut req = self
+                .http
+                .get(&url)
+                .header("X-Api-Key", &self.config.prowlarr.api_key)
+                .query(&[("query", &q), ("type", &"search".to_string())]);
+
+            for id in &source_ids {
+                req = req.query(&[("indexerIds", &id.to_string())]);
+            }
+
+            let resp = match req.send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    warn!(status = %r.status(), query = %q, "Prowlarr search returned non-success HTTP status");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, query = %q, "Prowlarr search request failed");
+                    continue;
+                }
+            };
+
+            let items: Vec<ProwlarrApiSearchItem> = resp.json().await.unwrap_or_default();
+            for i in items {
+                let Some(title) = i.title else { continue };
+                let guid = i.guid.unwrap_or_else(|| title.clone());
+                if seen_guids.insert(guid.clone()) {
+                    candidates.push(DiscoveredRelease {
+                        guid,
+                        title,
+                        indexer_id: i.indexer_id.unwrap_or(0),
+                        indexer_name: i.indexer.unwrap_or_default(),
+                        download_url: i.download_url,
+                        magnet_url: i.magnet_url,
+                        info_hash: i.info_hash,
+                        size_bytes: i.size.unwrap_or(0),
+                        seeders: i.seeders.unwrap_or(0),
+                        leechers: i.leechers.unwrap_or(0),
+                        publish_date: i.publish_date,
+                    });
+                }
+            }
+
+            // Stop if we found matching releases
+            if !candidates.is_empty() {
+                break;
+            }
+        }
+
+        Ok(candidates)
+    }
+
     /// Evaluates configured filter rules (include/exclude regex, group whitelist, resolution, seeders, size).
     pub fn check_filters(
         &self,
@@ -808,6 +903,14 @@ mod tests {
         let client = ProwlarrClient::new(cfg)?;
         let parsed = parse_anime_release(&items[0].title);
         assert!(client.check_filters(&items[0], &parsed).is_ok());
+
+        // Test search query construction for catch-up
+        let queries = ProwlarrClient::build_missing_episodes_queries(&parsed);
+        assert_eq!(queries[0], "Dandadan SubsPlease 1080p");
+        assert_eq!(queries[1], "Dandadan SubsPlease");
+        assert_eq!(queries[2], "Dandadan");
+        assert_eq!(queries[3], "Dandadan SubsPlease batch");
+
         Ok(())
     }
 }
