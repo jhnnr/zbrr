@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # AnimeZ (zbrr) Installer Script
-# Builds and installs the zbrr binary to your system PATH
+# Downloads and installs the prebuilt release binary from GitHub
 # ==============================================================================
 
 set -euo pipefail
+
+REPO="jhnnr/zbrr"
+BINARY_NAME="zbrr"
 
 # Text formatting
 BOLD="\033[1m"
@@ -19,41 +22,36 @@ log_success() { echo -e "${GREEN}[OK]${RESET} ${BOLD}$*${RESET}"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 
-# Locate script directory (repository root)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-
-# Defaults
-NO_BUILD=false
-SYSTEM_INSTALL=false
+TARGET_VERSION=""
 CUSTOM_DIR=""
+SYSTEM_INSTALL=false
 
 usage() {
     cat <<EOF
 Usage: ./install.sh [OPTIONS]
 
 Options:
-  --dir <path>, --prefix <path>   Custom directory to install the binary to (e.g. ~/.local/bin)
-  --system                        Install system-wide to /usr/local/bin (uses sudo if needed)
-  --no-build                      Skip 'cargo build --release' and install existing target binary
+  -v, --version <tag>             Target version to install (default: latest release)
+  -d, --dir <path>, --prefix <path> Installation directory (default: /usr/local/bin or ~/.local/bin)
+  --system                        Force installation to /usr/local/bin (elevates with sudo if needed)
   -h, --help                      Show this help message
 EOF
     exit 0
 }
 
-# Parse flags
+# Parse options
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dir|--prefix)
+        -v|--version)
+            TARGET_VERSION="$2"
+            shift 2
+            ;;
+        -d|--dir|--prefix)
             CUSTOM_DIR="$2"
             shift 2
             ;;
         --system)
             SYSTEM_INSTALL=true
-            shift
-            ;;
-        --no-build)
-            NO_BUILD=true
             shift
             ;;
         -h|--help)
@@ -66,59 +64,133 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo -e "${BOLD}=== AnimeZ (zbrr) Installation ===${RESET}\n"
+echo -e "${BOLD}=== AnimeZ (zbrr) Binary Installer ===${RESET}\n"
 
-# 1. Check Rust / Cargo if build is needed
-if [ "$NO_BUILD" = false ]; then
-    if ! command -v cargo >/dev/null 2>&1; then
-        log_error "Rust toolchain 'cargo' was not found in PATH."
-        echo "Please install Rust from https://rustup.rs/ before running this installer,"
-        echo "or run with --no-build if the binary has already been compiled."
+# 1. Detect OS
+OS_UNAME="$(uname -s)"
+case "$OS_UNAME" in
+    Linux)
+        if command -v ldd >/dev/null 2>&1 && ldd /bin/ls 2>&1 | grep -q 'musl'; then
+            TARGET_OS="unknown-linux-musl"
+        else
+            TARGET_OS="unknown-linux-gnu"
+        fi
+        EXT="tar.gz"
+        ;;
+    Darwin)
+        TARGET_OS="apple-darwin"
+        EXT="tar.gz"
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        TARGET_OS="pc-windows-msvc"
+        BINARY_NAME="zbrr.exe"
+        EXT="zip"
+        ;;
+    *)
+        log_error "Unsupported operating system: $OS_UNAME"
         exit 1
+        ;;
+esac
+
+# 2. Detect Architecture
+ARCH_UNAME="$(uname -m)"
+case "$ARCH_UNAME" in
+    x86_64|amd64)
+        TARGET_ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        TARGET_ARCH="aarch64"
+        ;;
+    *)
+        log_error "Unsupported architecture: $ARCH_UNAME"
+        exit 1
+        ;;
+esac
+
+TARGET_TRIPLE="${TARGET_ARCH}-${TARGET_OS}"
+log_info "Detected platform: ${BOLD}${TARGET_TRIPLE}${RESET}"
+
+# 3. Determine release version tag
+if [ -n "$TARGET_VERSION" ]; then
+    TAG="$TARGET_VERSION"
+    if [[ ! "$TAG" =~ ^v ]]; then
+        TAG="v$TAG"
+    fi
+    log_info "Installing specified version: $TAG"
+else
+    log_info "Fetching latest release tag from GitHub..."
+    LATEST_API="https://api.github.com/repos/${REPO}/releases/latest"
+    TAG=$(curl -sSL "$LATEST_API" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)
+
+    if [ -z "$TAG" ]; then
+        # Fallback to redirect location header if API is rate-limited
+        TAG=$(curl -sSI "https://github.com/${REPO}/releases/latest" 2>/dev/null | grep -i '^location:' | sed -E 's/.*\/tag\/([^ \r\n]+).*/\1/' || true)
     fi
 
-    log_info "Compiling zbrr in release mode ('cargo build --release')..."
-    cargo build --release
-    log_success "Compilation finished successfully."
+    if [ -z "$TAG" ]; then
+        log_error "Could not determine the latest release tag for ${REPO}."
+        log_error "You can specify a version explicitly using: ./install.sh --version v0.1.0"
+        exit 1
+    fi
+    log_info "Latest release: ${BOLD}${TAG}${RESET}"
 fi
 
-# 2. Locate built binary (supports Linux/macOS and Windows/MSYS)
-BINARY_SRC=""
-if [ -f "$SCRIPT_DIR/target/release/zbrr" ]; then
-    BINARY_SRC="$SCRIPT_DIR/target/release/zbrr"
-    BINARY_NAME="zbrr"
-elif [ -f "$SCRIPT_DIR/target/release/zbrr.exe" ]; then
-    BINARY_SRC="$SCRIPT_DIR/target/release/zbrr.exe"
-    BINARY_NAME="zbrr.exe"
-else
-    log_error "Could not find built binary at target/release/zbrr[.exe]."
-    log_error "Please run 'cargo build --release' first or omit --no-build."
-    exit 1
-fi
-
-# 3. Determine target install directory
+# 4. Determine installation directory
 if [ -n "$CUSTOM_DIR" ]; then
     INSTALL_DIR="$CUSTOM_DIR"
 elif [ "$SYSTEM_INSTALL" = true ]; then
     INSTALL_DIR="/usr/local/bin"
 else
-    # Non-root default: check writable /usr/local/bin, else ~/.local/bin
     if [ -w "/usr/local/bin" ] || [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
         INSTALL_DIR="/usr/local/bin"
     else
         INSTALL_DIR="$HOME/.local/bin"
     fi
 fi
-
-# Expand tilde if present in custom dir
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
-# Ensure install directory exists
+# 5. Download release archive
+ARCHIVE_NAME="zbrr-${TAG}-${TARGET_TRIPLE}.${EXT}"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE_NAME}"
+
+TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t 'zbrr')"
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+log_info "Downloading ${ARCHIVE_NAME}..."
+if ! curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_NAME"; then
+    echo ""
+    log_error "Failed to download $DOWNLOAD_URL"
+    log_error "Verify that this release asset exists on GitHub, or build from source using 'cargo build --release'."
+    exit 1
+fi
+
+# 6. Extract archive
+log_info "Extracting archive..."
+if [ "$EXT" = "zip" ]; then
+    if ! command -v unzip >/dev/null 2>&1; then
+        log_error "'unzip' is required to extract the Windows archive."
+        exit 1
+    fi
+    unzip -q "$TMP_DIR/$ARCHIVE_NAME" -d "$TMP_DIR"
+else
+    tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
+fi
+
+# Locate extracted binary
+EXTRACTED_BIN=$(find "$TMP_DIR" -type f \( -name "zbrr" -o -name "zbrr.exe" \) | head -n 1)
+if [ -z "$EXTRACTED_BIN" ] || [ ! -f "$EXTRACTED_BIN" ]; then
+    log_error "Could not find '${BINARY_NAME}' executable in extracted archive."
+    exit 1
+fi
+
+# 7. Install to target directory
 if [ ! -d "$INSTALL_DIR" ]; then
-    log_info "Creating target installation directory: $INSTALL_DIR"
+    log_info "Creating directory: $INSTALL_DIR"
     mkdir -p "$INSTALL_DIR" || {
         if command -v sudo >/dev/null 2>&1; then
-            log_info "Elevating with sudo to create $INSTALL_DIR..."
             sudo mkdir -p "$INSTALL_DIR"
         else
             log_error "Failed to create directory $INSTALL_DIR and sudo is unavailable."
@@ -128,23 +200,22 @@ if [ ! -d "$INSTALL_DIR" ]; then
 fi
 
 DEST_PATH="$INSTALL_DIR/$BINARY_NAME"
-
-# 4. Copy / Install binary
 log_info "Installing $BINARY_NAME to $INSTALL_DIR..."
+
 if [ -w "$INSTALL_DIR" ] || [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
     if command -v install >/dev/null 2>&1; then
-        install -m 755 "$BINARY_SRC" "$DEST_PATH"
+        install -m 755 "$EXTRACTED_BIN" "$DEST_PATH"
     else
-        cp -f "$BINARY_SRC" "$DEST_PATH"
+        cp -f "$EXTRACTED_BIN" "$DEST_PATH"
         chmod +x "$DEST_PATH" 2>/dev/null || true
     fi
 else
     if command -v sudo >/dev/null 2>&1; then
-        log_info "Elevating permissions with sudo to install into $INSTALL_DIR..."
+        log_info "Elevating with sudo to install into $INSTALL_DIR..."
         if command -v install >/dev/null 2>&1; then
-            sudo install -m 755 "$BINARY_SRC" "$DEST_PATH"
+            sudo install -m 755 "$EXTRACTED_BIN" "$DEST_PATH"
         else
-            sudo cp -f "$BINARY_SRC" "$DEST_PATH"
+            sudo cp -f "$EXTRACTED_BIN" "$DEST_PATH"
             sudo chmod +x "$DEST_PATH" 2>/dev/null || true
         fi
     else
@@ -156,19 +227,13 @@ fi
 
 log_success "Binary installed at: $DEST_PATH"
 
-# 5. Initialize user configuration directory ~/.zbrr if missing
+# 8. Ensure ~/.zbrr data directory exists
 ZBRR_USER_DIR="$HOME/.zbrr"
 if [ ! -d "$ZBRR_USER_DIR" ]; then
-    log_info "Initializing zbrr data directory: $ZBRR_USER_DIR"
     mkdir -p "$ZBRR_USER_DIR"
 fi
 
-if [ -f "$SCRIPT_DIR/.env" ] && [ ! -f "$ZBRR_USER_DIR/.env" ]; then
-    log_info "Copying local .env template to $ZBRR_USER_DIR/.env for persistent service execution..."
-    cp -n "$SCRIPT_DIR/.env" "$ZBRR_USER_DIR/.env" 2>/dev/null || true
-fi
-
-# 6. Verify PATH accessibility
+# 9. Verify PATH
 echo ""
 IN_PATH=false
 IFS=':' read -ra PATH_DIRS <<< "$PATH"
@@ -187,7 +252,7 @@ else
     echo -e "    ${BOLD}export PATH=\"\$PATH:$INSTALL_DIR\"${RESET}\n"
 fi
 
-# 7. Test execution
+# 10. Test execution
 if command -v zbrr >/dev/null 2>&1; then
     log_success "Verified: 'zbrr' is executable directly from PATH:"
     zbrr --version || true
@@ -196,4 +261,4 @@ elif [ -x "$DEST_PATH" ]; then
     "$DEST_PATH" --version || true
 fi
 
-echo -e "\n${BOLD}${GREEN}Installation completed!${RESET} Run ${CYAN}zbrr doctor${RESET} to verify external services and tools."
+echo -e "\n${BOLD}${GREEN}Installation completed!${RESET} Run ${CYAN}zbrr doctor${RESET} to check connectivity."
