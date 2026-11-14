@@ -66,11 +66,26 @@ done
 
 echo -e "${BOLD}=== AnimeZ (zbrr) Binary Installer ===${RESET}\n"
 
-# 1. Detect OS
+# 1. Detect Architecture
+ARCH_UNAME="$(uname -m)"
+case "$ARCH_UNAME" in
+    x86_64|amd64)
+        TARGET_ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        TARGET_ARCH="aarch64"
+        ;;
+    *)
+        log_error "Unsupported architecture: $ARCH_UNAME"
+        exit 1
+        ;;
+esac
+
+# 2. Detect OS
 OS_UNAME="$(uname -s)"
 case "$OS_UNAME" in
     Linux)
-        if command -v ldd >/dev/null 2>&1 && ldd /bin/ls 2>&1 | grep -q 'musl'; then
+        if [ "$TARGET_ARCH" = "x86_64" ] && command -v ldd >/dev/null 2>&1 && ldd /bin/ls 2>&1 | grep -q 'musl'; then
             TARGET_OS="unknown-linux-musl"
         else
             TARGET_OS="unknown-linux-gnu"
@@ -88,21 +103,6 @@ case "$OS_UNAME" in
         ;;
     *)
         log_error "Unsupported operating system: $OS_UNAME"
-        exit 1
-        ;;
-esac
-
-# 2. Detect Architecture
-ARCH_UNAME="$(uname -m)"
-case "$ARCH_UNAME" in
-    x86_64|amd64)
-        TARGET_ARCH="x86_64"
-        ;;
-    aarch64|arm64)
-        TARGET_ARCH="aarch64"
-        ;;
-    *)
-        log_error "Unsupported architecture: $ARCH_UNAME"
         exit 1
         ;;
 esac
