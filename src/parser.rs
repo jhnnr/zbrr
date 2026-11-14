@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::models::{MalMetadata, ParsedRelease};
 use anyhow::{Context, Result};
+use chrono::{Datelike, Utc};
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
@@ -446,6 +447,228 @@ impl JikanResolver {
     }
 }
 
+/// Formats a torrent release title strictly according to AnimeZ official naming standards:
+/// https://animez.to/guides/how-to-properly-titlename-a-torrent
+///
+/// Rules:
+/// - Anime - Ongoing:
+///   `[AniDB Main Title] - [Episode] (Year) [Fansub] [Additional Tags...]`
+///   If the anime includes the year as part of the AniDB main title:
+///   `[AniDB Main Title with (Year)] - [Episode] [Fansub] [Additional Tags...]`
+/// - Anime - Season Batch / Partial Batch:
+///   `[AniDB Main Title] (Season xx) - [Episodes] (Year) [Fansub] [Additional Tags...]`
+/// - Anime - Complete:
+///   `[AniDB Main Title] (Year) [Fansub] [Additional Tags...]`
+///
+/// Permitted Additional Tags (strictly enforced, in canonical order):
+///   `[Dual Audio]`, `[Multi Audio]`, `[English Dubbed]`, `[RAW]`, `[HDR10]` / `[HDR10+]`, `[HEVC]`, `[10-bit]`
+pub fn format_animez_torrent_title(
+    parsed: &ParsedRelease,
+    mal: Option<&MalMetadata>,
+    animez_title: Option<&str>,
+) -> String {
+    // 1. Determine canonical base title (prefer AnimeZ tracker entry / MAL Romaji / AniDB title)
+    let raw_title = if let Some(at) = animez_title {
+        if !at.trim().is_empty() {
+            at.trim().to_string()
+        } else if let Some(m) = mal {
+            if !m.title.trim().is_empty() {
+                m.title.trim().to_string()
+            } else {
+                parsed.clean_title.trim().to_string()
+            }
+        } else {
+            parsed.clean_title.trim().to_string()
+        }
+    } else if let Some(m) = mal {
+        if !m.title.trim().is_empty() {
+            m.title.trim().to_string()
+        } else {
+            parsed.clean_title.trim().to_string()
+        }
+    } else {
+        parsed.clean_title.trim().to_string()
+    };
+
+    static YEAR_IN_PAREN_RE: OnceLock<Regex> = OnceLock::new();
+    let year_in_paren_re = YEAR_IN_PAREN_RE.get_or_init(|| {
+        Regex::new(r"\((?:19\d{2}|20\d{2})\)").unwrap()
+    });
+    let title_has_year = year_in_paren_re.is_match(&raw_title);
+
+    let release_year = parsed
+        .year
+        .or_else(|| mal.and_then(|m| m.year))
+        .unwrap_or_else(|| Utc::now().year() as u32);
+
+    let mut title_part = raw_title.clone();
+
+    // Check if season should be added if not already part of the title
+    static SEASON_RE: OnceLock<Regex> = OnceLock::new();
+    let season_re = SEASON_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:Season\s*\d+|2nd\s*Season|3rd\s*Season|\d+th\s*Season)\b").unwrap()
+    });
+
+    if let Some(s) = parsed.season {
+        if s > 1 && !season_re.is_match(&title_part) {
+            title_part = format!("{title_part} (Season {s:02})");
+        }
+    }
+
+    // 2. Format episode / batch portion
+    let mut ep_part = String::new();
+    if parsed.is_season_pack {
+        // Try extracting episode range like "01-12" from raw title
+        static EP_RANGE_RE: OnceLock<Regex> = OnceLock::new();
+        let ep_range_re = EP_RANGE_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(\d{1,4})\s*-\s*(\d{1,4})\b").unwrap()
+        });
+        if let Some(caps) = ep_range_re.captures(&parsed.raw_title) {
+            let start = caps[1].parse::<u32>().unwrap_or(1);
+            let end = caps[2].parse::<u32>().unwrap_or(start);
+            if start < 100 && end < 100 {
+                ep_part = format!("- {:02}-{:02}", start, end);
+            } else {
+                ep_part = format!("- {start}-{end}");
+            }
+        }
+    } else if let Some(ep) = parsed.episode {
+        if ep < 100 {
+            ep_part = format!("- {:02}", ep);
+        } else {
+            ep_part = format!("- {}", ep);
+        }
+    }
+
+    // 3. Assemble core title with Year
+    let core = if !ep_part.is_empty() {
+        if title_has_year {
+            format!("{title_part} {ep_part}")
+        } else {
+            format!("{title_part} {ep_part} ({release_year})")
+        }
+    } else if title_has_year {
+        title_part
+    } else {
+        format!("{title_part} ({release_year})")
+    };
+
+    // 4. Fansub Group
+    let group = parsed
+        .release_group
+        .as_deref()
+        .unwrap_or("AnimeZ")
+        .trim();
+    let group_tag = format!("[{group}]");
+
+    // 5. Allowed Additional Tags in canonical order:
+    // [Dual Audio] / [Multi Audio] / [English Dubbed] / [RAW]
+    // [HDR10] / [HDR10+]
+    // [HEVC]
+    // [10-bit]
+    let mut additional_tags = Vec::new();
+    let raw_upper = parsed.raw_title.to_ascii_uppercase();
+
+    // Audio tags
+    if parsed.dual_audio || raw_upper.contains("DUAL AUDIO") || raw_upper.contains("DUAL-AUDIO") {
+        additional_tags.push("[Dual Audio]");
+    } else if raw_upper.contains("MULTI AUDIO") || raw_upper.contains("MULTI-AUDIO") {
+        additional_tags.push("[Multi Audio]");
+    } else if raw_upper.contains("ENGLISH DUBBED") || raw_upper.contains("ENG DUB") {
+        additional_tags.push("[English Dubbed]");
+    } else if raw_upper.contains("[RAW]") || raw_upper.contains("-RAW ") || raw_upper.contains(" RAW ") {
+        additional_tags.push("[RAW]");
+    }
+
+    // Codec tag (HEVC)
+    let is_hevc = parsed
+        .video_codec
+        .as_deref()
+        .map(|vc| {
+            let u = vc.to_ascii_uppercase();
+            u.contains("HEVC") || u.contains("X265") || u.contains("H265") || u.contains("H.265")
+        })
+        .unwrap_or(false)
+        || raw_upper.contains("HEVC")
+        || raw_upper.contains("X265")
+        || raw_upper.contains("H265");
+    if is_hevc {
+        additional_tags.push("[HEVC]");
+    }
+
+    // HDR tag
+    if raw_upper.contains("HDR10+") {
+        additional_tags.push("[HDR10+]");
+    } else if raw_upper.contains("HDR10") || raw_upper.contains("[HDR]") {
+        additional_tags.push("[HDR10]");
+    }
+
+    // Bit depth tag
+    let is_10bit = parsed
+        .bit_depth
+        .as_deref()
+        .map(|b| b.contains("10"))
+        .unwrap_or(false)
+        || raw_upper.contains("10BIT")
+        || raw_upper.contains("10-BIT");
+    if is_10bit {
+        additional_tags.push("[10-bit]");
+    }
+
+    let mut parts = vec![core, group_tag];
+    for tag in additional_tags {
+        parts.push(tag.to_string());
+    }
+
+    parts.join(" ")
+}
+
+/// Validates an anime release against AnimeZ official Upload Rules (UPLOAD_RULES.md).
+/// Rejects containers, video codecs, resolutions, or release types prohibited by the tracker.
+pub fn check_animez_rule_compliance(parsed: &ParsedRelease) -> std::result::Result<(), String> {
+    // 1. Prohibited leaks / pre-airs (Section 1)
+    static LEAK_RE: OnceLock<Regex> = OnceLock::new();
+    let leak_re = LEAK_RE.get_or_init(|| Regex::new(r"(?i)\b(pre-?air|leak)\b").unwrap());
+    if leak_re.is_match(&parsed.raw_title) {
+        return Err("Pre-air leaks are strictly prohibited by AnimeZ upload rules (Section 1)".to_string());
+    }
+
+    // 2. Container verification (Section 2)
+    // Allowed: MKV, MP4, AVI, M2TS, VOB, TS
+    if let Some(c) = &parsed.container {
+        let upper = c.to_ascii_uppercase();
+        if !matches!(upper.as_str(), "MKV" | "MP4" | "AVI" | "M2TS" | "VOB" | "TS") {
+            return Err(format!(
+                "Container '{c}' is not permitted by AnimeZ upload rules; only MKV, MP4, AVI (and full disc M2TS/VOB) are allowed"
+            ));
+        }
+    }
+
+    // 3. Video Codec verification (Section 2)
+    // Allowed: H264/AVC, H265/HEVC (MPEG2 for DVD/HDTV, VC-1 for BD)
+    // Prohibited: AV1, VP9, VP8, XVID, DIVX
+    if let Some(vc) = &parsed.video_codec {
+        let upper = vc.to_ascii_uppercase();
+        if upper.contains("AV1") || upper.contains("VP9") || upper.contains("VP8") || upper.contains("XVID") || upper.contains("DIVX") {
+            return Err(format!(
+                "Video codec '{vc}' is not permitted by AnimeZ upload rules; only H264/AVC and H265/HEVC are allowed for anime encodes"
+            ));
+        }
+    }
+
+    // 4. Minimum Resolution verification (Section 2: minimum 480p)
+    if let Some(res) = &parsed.resolution {
+        let lower = res.to_ascii_lowercase();
+        if lower.contains("360p") || lower.contains("240p") || lower.contains("144p") {
+            return Err(format!(
+                "Resolution '{res}' is below AnimeZ minimum required resolution (480p)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +719,57 @@ mod tests {
         assert_eq!(p.bit_depth.as_deref(), Some("10bit"));
         assert!(p.dual_audio);
         assert!(p.multi_sub);
+    }
+
+    #[test]
+    fn test_format_animez_torrent_title_ongoing() {
+        let p = parse_anime_release(
+            "[Erai-raws] Marronnier Oukoku no Shichinin no Kishi - 07 [1080p AMZN WEBRip HEVC EAC3][MultiSub][671E6865].mkv",
+        );
+        let title = format_animez_torrent_title(&p, None, None);
+        // Clean ongoing format: Title - Ep (Year) [Group] [HEVC]
+        assert_eq!(
+            title,
+            format!("Marronnier Oukoku no Shichinin no Kishi - 07 ({}) [Erai-raws] [HEVC]", Utc::now().year())
+        );
+    }
+
+    #[test]
+    fn test_format_animez_torrent_title_with_year_in_title() {
+        let p = parse_anime_release(
+            "[Erai-raws] Ranma 1/2 (2024) - 07 [1080p NF WEBRip HEVC AAC][MultiSub][44A0F064].mkv",
+        );
+        let title = format_animez_torrent_title(&p, None, Some("Ranma 1/2 (2024)"));
+        // Does not duplicate year if title already contains (2024)
+        assert_eq!(title, "Ranma 1/2 (2024) - 07 [Erai-raws] [HEVC]");
+    }
+
+    #[test]
+    fn test_format_animez_torrent_title_batch() {
+        let p = parse_anime_release(
+            "[030] Sister Breeder - 01-06 [1080p HEVC 10-bit] (Batch)",
+        );
+        let title = format_animez_torrent_title(&p, None, None);
+        assert_eq!(
+            title,
+            format!("Sister Breeder - 01-06 ({}) [030] [HEVC] [10-bit]", Utc::now().year())
+        );
+    }
+
+    #[test]
+    fn test_check_animez_rule_compliance() {
+        let valid = parse_anime_release("[SubsPlease] Title - 01 (1080p) [HEVC].mkv");
+        assert!(check_animez_rule_compliance(&valid).is_ok());
+
+        let leak = parse_anime_release("[Leak] Title - 01 Pre-air [1080p].mkv");
+        assert!(check_animez_rule_compliance(&leak).is_err());
+
+        let mut bad_codec = parse_anime_release("[Group] Title - 01 (1080p).mkv");
+        bad_codec.video_codec = Some("AV1".to_string());
+        assert!(check_animez_rule_compliance(&bad_codec).is_err());
+
+        let mut low_res = parse_anime_release("[Group] Title - 01 (360p).mkv");
+        low_res.resolution = Some("360p".to_string());
+        assert!(check_animez_rule_compliance(&low_res).is_err());
     }
 }

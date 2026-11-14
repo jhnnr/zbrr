@@ -1,5 +1,6 @@
 use crate::animez_client::{AnimezClient, TrackerTorrentEntry};
 use crate::config::AppConfig;
+use crate::db::Database;
 use crate::models::{DupeCheckResult, ParsedRelease};
 use crate::parser::parse_anime_release;
 use crate::prowlarr::ProwlarrClient;
@@ -113,6 +114,85 @@ impl DupeChecker {
         })
     }
 
+    /// Enforces AnimeZ Section 3 Ongoing Catch-Up Rule:
+    /// If an ongoing anime has reached episode > 1, a user cannot start uploading standalone mid-season episodes
+    /// without either having uploaded the prior episodes (01..N-1) or uploading a catch-up batch (01..N).
+    pub async fn check_ongoing_catchup_rule(
+        &self,
+        parsed: &ParsedRelease,
+        mal_id: Option<u64>,
+        db: &Database,
+    ) -> Result<Option<String>> {
+        if !self.config.animez.enforce_ongoing_catchup {
+            return Ok(None);
+        }
+
+        // Batches and movie/specials are permitted without ongoing sequence checks
+        if parsed.is_season_pack {
+            return Ok(None);
+        }
+
+        let Some(ep) = parsed.episode else {
+            return Ok(None);
+        };
+
+        // Episode 1 (or 0) starts a sequence, always permitted
+        if ep <= 1 {
+            return Ok(None);
+        }
+
+        // 1. Check local SQLite DB for prior SEEDING uploads for this anime
+        let db_clone = db.clone();
+        let clean_title = parsed.clean_title.clone();
+        let season = parsed.season;
+        let has_local_prior = tokio::task::spawn_blocking(move || {
+            db_clone.has_prior_upload_for_anime(&clean_title, mal_id, season)
+        })
+        .await??;
+
+        if has_local_prior {
+            debug!(
+                title = %parsed.clean_title,
+                episode = ep,
+                "Prior local seeding upload found for anime; ongoing sequence satisfied"
+            );
+            return Ok(None);
+        }
+
+        // 2. Check AnimeZ tracker profile uploads
+        let username = self.config.animez.username.trim();
+        if !username.is_empty() && !username.starts_with("REPLACE_") && !username.starts_with("your_") {
+            match self
+                .animez
+                .has_user_uploaded_prior_episode(username, &parsed.clean_title)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        title = %parsed.clean_title,
+                        episode = ep,
+                        uploader = username,
+                        "Prior upload found on AnimeZ tracker profile; ongoing sequence satisfied"
+                    );
+                    return Ok(None);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        uploader = username,
+                        "Could not check profile uploads on AnimeZ; relying on local database"
+                    );
+                }
+            }
+        }
+
+        let reason = format!(
+            "AnimeZ upload rules (Section 3) catch-up violation: episode {ep} > 1 cannot be uploaded mid-season without prior sequence (episodes 01~{ep}); upload a catch-up batch of all available episodes first"
+        );
+        Ok(Some(reason))
+    }
+
     pub fn find_matching_entry(
         candidate: &ParsedRelease,
         existing_entries: &[TrackerTorrentEntry],
@@ -206,5 +286,62 @@ mod tests {
             "[Erai-raws] Sousou no Frieren - 12 (1080p) [ABCDEF12].mkv",
         );
         assert!(!DupeChecker::is_same_release(&candidate, &diff_group));
+    }
+
+    #[tokio::test]
+    async fn test_check_ongoing_catchup_rule() -> Result<()> {
+        use tempfile::tempdir;
+        let dir = tempdir()?;
+        let db = Database::open(dir.path().join("dupe_test.db"))?;
+
+        let mut config = AppConfig::default();
+        config.animez.enforce_ongoing_catchup = true;
+        // Don't check live tracker in unit test
+        config.animez.username = "".to_string();
+
+        let flaresolverr = crate::flaresolverr::FlareSolverrClient::new(config.clone())?;
+        let animez = AnimezClient::new(config.clone(), flaresolverr)?;
+        let prowlarr = ProwlarrClient::new(config.clone())?;
+        let checker = DupeChecker::new(config, prowlarr, animez);
+
+        // Episode 1 is always allowed
+        let ep1 = parse_anime_release("[SubsPlease] Frieren - 01 (1080p).mkv");
+        let res1 = checker.check_ongoing_catchup_rule(&ep1, Some(100), &db).await?;
+        assert!(res1.is_none(), "Episode 1 should always be allowed");
+
+        // Batches are always allowed
+        let batch = parse_anime_release("[SubsPlease] Frieren - 01-06 (1080p) (Batch).mkv");
+        let res_batch = checker.check_ongoing_catchup_rule(&batch, Some(100), &db).await?;
+        assert!(res_batch.is_none(), "Batches should always be allowed");
+
+        // Episode 7 without prior sequence is rejected by catch-up rule
+        let ep7 = parse_anime_release("[SubsPlease] Frieren - 07 (1080p).mkv");
+        let res7 = checker.check_ongoing_catchup_rule(&ep7, Some(100), &db).await?;
+        assert!(res7.is_some(), "Episode 7 without prior sequence must be skipped");
+        assert!(res7.unwrap().contains("catch-up violation"));
+
+        // Insert Ep 1 as SEEDING in DB
+        let disc = crate::models::DiscoveredRelease {
+            guid: "ep1-guid".to_string(),
+            title: ep1.raw_title.clone(),
+            indexer_id: 1,
+            indexer_name: "Nyaa".to_string(),
+            download_url: None,
+            magnet_url: None,
+            info_hash: None,
+            size_bytes: 1000,
+            seeders: 10,
+            leechers: 0,
+            publish_date: None,
+        };
+        let id = db.insert_discovered(&disc, &ep1)?;
+        db.set_dupe_checked(id, Some(100))?;
+        db.set_seeding(id, Some("https://animez.to/torrents/100"))?;
+
+        // Now Episode 7 is allowed because the uploader established prior sequence in DB
+        let res7_after = checker.check_ongoing_catchup_rule(&ep7, Some(100), &db).await?;
+        assert!(res7_after.is_none(), "Episode 7 must be allowed once prior sequence is in DB");
+
+        Ok(())
     }
 }

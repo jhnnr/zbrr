@@ -417,6 +417,60 @@ impl Database {
         Ok(())
     }
 
+    /// Checks if SQLite already tracks a successfully uploaded / seeding release for this anime.
+    pub fn has_prior_upload_for_anime(
+        &self,
+        clean_title: &str,
+        mal_id: Option<u64>,
+        season: Option<u32>,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let s = season.unwrap_or(1);
+        let season_token = format!("|s{s:02}");
+
+        // 1. Check by MAL ID if available
+        if let Some(mid) = mal_id {
+            let by_mal: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM releases WHERE state = 'SEEDING' AND mal_id = ?1 LIMIT 1",
+                    params![mid as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if by_mal.is_some() {
+                return Ok(true);
+            }
+        }
+
+        // 2. Check by normalized title & season in normalized_key
+        if !norm_prefix.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, normalized_key FROM releases WHERE state = 'SEEDING' AND normalized_key LIKE ?1 LIMIT 10",
+            )?;
+            let like_pat = format!("{norm_prefix}%");
+            let rows = stmt.query_map(params![like_pat], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (_, key) = row?;
+                if key.contains(&season_token) || key.starts_with(&norm_prefix) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRecord> {
         let state_str: String = row.get("state")?;
         let state = ReleaseState::from_str(&state_str).unwrap_or(ReleaseState::Failed);
@@ -511,6 +565,10 @@ mod tests {
 
         let next = db.reset_for_retry(id)?;
         assert_eq!(next, ReleaseState::DupeChecked);
+
+        assert!(!db.has_prior_upload_for_anime("Frieren", Some(52991), Some(1))?);
+        db.set_seeding(id, Some("https://animez.to/torrents/123"))?;
+        assert!(db.has_prior_upload_for_anime("Frieren", Some(52991), Some(1))?);
 
         Ok(())
     }

@@ -33,7 +33,7 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
 4. **Media Packaging (`packager.rs` & `torrent_builder.rs`)**
    - Inspects the downloaded files on disk (ignoring OS junk files).
    - **MediaInfo**: Invokes the `mediainfo` CLI binary to extract clean raw text MediaInfo from the primary `.mkv`/`.mp4` file, stripping local filesystem paths from `Complete name`.
-   - **Screenshots**: Invokes `ffprobe` for duration and `ffmpeg` to extract 3–4 high-quality JPEG screenshots (with WebP/PNG support) at evenly spaced timestamps (e.g., 15%, 35%, 55%, 75% of duration), keeping multipart upload payload under tracker HTTP 413 limits.
+   - **Screenshots**: Invokes `ffprobe` for duration and `ffmpeg` to extract a minimum of 6 high-quality JPEG screenshots (as strictly required by AnimeZ Upload Rules, see UPLOAD_RULES.md) at evenly spaced timestamps (e.g. 10%, 25%, 40%, 55%, 70%, 85% of duration), keeping multipart upload payload under tracker HTTP 413 limits.
    - **Fast Multi-Threaded Torrent Creation (`torrent_builder.rs`)**:
      - Uses `rayon` + `sha1` + `serde_bencode` to hash pieces in parallel across CPU cores and generate a brand-new `.torrent` file directly from the downloaded disk payload with:
        - `info.private = 1`
@@ -115,3 +115,10 @@ F:\Dev Stuff\AnimeZ\
    - Enforce polite delays (`2–5 seconds` jitter) between HTTP requests to `animez.to` and Jikan API.
 6. **Zero Hardcoded Secrets:**
    - Never commit AnimeZ credentials (`username`, `password`, `pid`), session cookies, announce URLs, Prowlarr API keys, or qBittorrent API keys. All secrets must load from `.env` (which must be in `.gitignore`).
+7. **Strict AnimeZ Naming Conventions:**
+   - Never upload raw scene or indexer release filenames (e.g. `[Group] Title - S01E07 [1080p NF WEBRip HEVC AAC][MultiSub][CRC]`).
+   - Titles must strictly conform to AnimeZ's naming guide (`https://animez.to/guides/how-to-properly-titlename-a-torrent`): `[AniDB Main Title] - [Episode] (Year) [Fansub] [Additional Tags...]` without resolutions, rip types, audio codecs, or CRC hashes, retaining only permitted tags (`[Dual Audio]`, `[Multi Audio]`, `[English Dubbed]`, `[RAW]`, `[HDR10]`, `[HEVC]`, `[10-bit]`).
+8. **Anime Screenshot Requirement (Minimum 6):**
+   - Anime uploads strictly require a minimum of 6 screenshots (maximum 9). The packager, pipeline, and uploader must validate that at least 6 screenshots exist and abort before uploading if fewer than 6 were generated.
+9. **Ongoing Series Catch-Up Rule:**
+   - Per Section 3 of AnimeZ Upload Rules, standalone single episodes with `episode > 1` cannot be uploaded mid-season unless the user has established a prior sequence (having uploaded prior episodes in local DB or tracker profile) or uploads a catch-up batch of all episodes to date (`01~N`). Standalone mid-season episodes without prior sequence must be marked `SKIPPED`.

@@ -718,13 +718,13 @@ impl AnimezClient {
         Ok(Self::parse_torrent_search_html(base, &html))
     }
 
-    /// Resolves AnimeZ's internal anime ID (`anime_id`) for a release using `https://animez.to/search?type=anime&q=...`.
-    pub async fn lookup_anime_id(
+    /// Resolves AnimeZ's internal anime entry (`(id, title)`) for a release using `https://animez.to/search?type=anime&q=...`.
+    pub async fn lookup_anime_entry(
         &self,
         title: &str,
         year: Option<u32>,
         mal_id: Option<u64>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, String)>> {
         let base = self.config.animez.base_url.trim_end_matches('/');
         let mut url = url::Url::parse(&format!("{base}/search"))?;
         url.query_pairs_mut()
@@ -769,9 +769,9 @@ impl AnimezClient {
                                 anime_id = item.id,
                                 anime_title = %item.title,
                                 mal_id = target_mal,
-                                "Resolved AnimeZ anime ID via MAL ID match"
+                                "Resolved AnimeZ anime entry via MAL ID match"
                             );
-                            return Ok(Some(item.id));
+                            return Ok(Some((item.id, item.title.clone())));
                         }
                     }
                 }
@@ -793,9 +793,9 @@ impl AnimezClient {
                             anime_id = item.id,
                             anime_title = %item.title,
                             year = y1,
-                            "Resolved AnimeZ anime ID via title and year match"
+                            "Resolved AnimeZ anime entry via title and year match"
                         );
-                        return Ok(Some(item.id));
+                        return Ok(Some((item.id, item.title.clone())));
                     }
                 }
             }
@@ -811,9 +811,9 @@ impl AnimezClient {
                 info!(
                     anime_id = item.id,
                     anime_title = %item.title,
-                    "Resolved AnimeZ anime ID via normalized title match"
+                    "Resolved AnimeZ anime entry via normalized title match"
                 );
-                return Ok(Some(item.id));
+                return Ok(Some((item.id, item.title.clone())));
             }
         }
 
@@ -822,12 +822,75 @@ impl AnimezClient {
             info!(
                 anime_id = first.id,
                 anime_title = %first.title,
-                "Resolved AnimeZ anime ID to first candidate in search results"
+                "Resolved AnimeZ anime entry to first candidate in search results"
             );
-            return Ok(Some(first.id));
+            return Ok(Some((first.id, first.title.clone())));
         }
 
         Ok(None)
+    }
+
+    /// Resolves AnimeZ's internal anime ID (`anime_id`) for a release using `https://animez.to/search?type=anime&q=...`.
+    pub async fn lookup_anime_id(
+        &self,
+        title: &str,
+        year: Option<u32>,
+        mal_id: Option<u64>,
+    ) -> Result<Option<u64>> {
+        self.lookup_anime_entry(title, year, mal_id)
+            .await
+            .map(|opt| opt.map(|(id, _)| id))
+    }
+
+    /// Resolves AnimeZ's internal canonical anime title for a release using `https://animez.to/search?type=anime&q=...`.
+    pub async fn lookup_anime_title(
+        &self,
+        title: &str,
+        year: Option<u32>,
+        mal_id: Option<u64>,
+    ) -> Result<Option<String>> {
+        self.lookup_anime_entry(title, year, mal_id)
+            .await
+            .map(|opt| opt.map(|(_, t)| t))
+    }
+
+    /// Checks whether the user has any existing uploads for a given anime title on AnimeZ.
+    pub async fn has_user_uploaded_prior_episode(
+        &self,
+        username: &str,
+        anime_title: &str,
+    ) -> Result<bool> {
+        let trimmed_user = username.trim();
+        if trimmed_user.is_empty() || trimmed_user.starts_with("REPLACE_") {
+            return Ok(false);
+        }
+
+        let base = self.config.animez.base_url.trim_end_matches('/');
+        let mut url = url::Url::parse(&format!("{base}/profile/{trimmed_user}/uploads"))?;
+        url.query_pairs_mut().append_pair("q", anime_title.trim());
+
+        let html = match self.get_html(url.as_str()).await {
+            Ok(h) => h,
+            Err(e) => {
+                debug!(error = %e, url = %url, "Could not fetch user profile uploads page");
+                return Ok(false);
+            }
+        };
+
+        let entries = Self::parse_torrent_search_html(base, &html);
+        if entries.is_empty() {
+            return Ok(false);
+        }
+
+        let norm_target = Self::normalize_title_for_lookup(anime_title);
+        for entry in entries {
+            let norm_entry = Self::normalize_title_for_lookup(&entry.title);
+            if norm_entry.contains(&norm_target) || norm_target.contains(&norm_entry) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub fn parse_torrent_search_html(base_url: &str, html: &str) -> Vec<TrackerTorrentEntry> {
@@ -877,9 +940,30 @@ impl AnimezClient {
         bundle: &PackageBundle,
         dry_run: bool,
     ) -> Result<UploadResult> {
+        // Enforce AnimeZ upload rules (Section 6: minimum 6 screenshots for anime uploads)
+        if bundle.screenshots.len() < 6 {
+            anyhow::bail!(
+                "Cannot upload to AnimeZ: Anime uploads strictly require a minimum of 6 screenshots (found {}). Aborting to comply with AnimeZ Upload Rules (Section 6).",
+                bundle.screenshots.len()
+            );
+        }
+
+        let animez_title = self
+            .lookup_anime_title(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+            .await
+            .ok()
+            .flatten();
+
+        let torrent_name = crate::parser::format_animez_torrent_title(
+            parsed,
+            mal,
+            animez_title.as_deref(),
+        );
+
         if dry_run || self.config.general.dry_run {
             info!(
                 title = %parsed.raw_title,
+                formatted_name = %torrent_name,
                 torrent = %bundle.torrent_path.display(),
                 mediainfo = %bundle.mediainfo_path.display(),
                 screenshots = bundle.screenshots.len(),
@@ -930,10 +1014,16 @@ impl AnimezClient {
         let description = Self::build_release_description(parsed, mal);
         let format_val = Self::detect_release_format(parsed);
 
+        info!(
+            raw_title = %parsed.raw_title,
+            formatted_name = %torrent_name,
+            "Submitting upload with formatted torrent title adhering to AnimeZ naming conventions"
+        );
+
         let mut form = Form::new()
             .text("_token", csrf_token)
             .part("torrent", torrent_part)
-            .text("name", parsed.raw_title.clone())
+            .text("name", torrent_name)
             .text("title", parsed.clean_title.clone())
             .text("format", format_val)
             .text("media_info", bundle.mediainfo_text.clone())
@@ -1120,12 +1210,18 @@ impl AnimezClient {
                 "Screenshots uploaded to draft"
             );
 
-            // Resolve AnimeZ internal anime_id
-            let anime_id = match self
-                .lookup_anime_id(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+            if uploaded_shots < 6 {
+                anyhow::bail!(
+                    "Draft torrent {tid} has only {uploaded_shots} screenshots successfully uploaded; AnimeZ upload rules (Section 6) strictly require at least 6 screenshots before publishing",
+                );
+            }
+
+            // Resolve AnimeZ internal anime entry (ID and canonical title)
+            let (anime_id, anime_title) = match self
+                .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
                 .await?
             {
-                Some(aid) => aid,
+                Some(entry) => entry,
                 None => {
                     anyhow::bail!(
                         "Could not resolve AnimeZ anime ID for '{}' (mal_id: {:?}); draft {tid} not published",
@@ -1144,6 +1240,7 @@ impl AnimezClient {
                     bundle,
                     &edit_csrf_token,
                     anime_id,
+                    Some(&anime_title),
                     &final_url,
                 )
                 .await?;
@@ -1296,10 +1393,17 @@ impl AnimezClient {
         bundle: &PackageBundle,
         csrf_token: &str,
         anime_id: u64,
+        anime_title: Option<&str>,
         edit_page_url: &str,
     ) -> Result<String> {
         let base = self.config.animez.base_url.trim_end_matches('/');
         let publish_url = format!("{base}/torrents/{torrent_id}");
+
+        let torrent_name = crate::parser::format_animez_torrent_title(
+            parsed,
+            mal,
+            anime_title,
+        );
 
         let description = Self::build_release_description(parsed, mal);
         let format_val = Self::detect_release_format(parsed);
@@ -1324,7 +1428,7 @@ impl AnimezClient {
             .text("_method", "PATCH")
             .text("is_draft", "0")
             .text("anime_id", anime_id.to_string())
-            .text("name", parsed.raw_title.clone())
+            .text("name", torrent_name)
             .text("format", format_val)
             .text("resolution", resolution_val)
             .text("rip_type", rip_type_val)
@@ -1590,5 +1694,31 @@ mod tests {
             AnimezClient::extract_form_errors(err_html),
             "At least 3 screenshots required to publish."
         );
+    }
+
+    #[tokio::test]
+    async fn test_upload_release_fails_if_screenshots_under_6() {
+        let config = AppConfig::default();
+        let flaresolverr = crate::flaresolverr::FlareSolverrClient::new(config.clone()).unwrap();
+        let client = AnimezClient::new(config, flaresolverr).unwrap();
+
+        let parsed = crate::parser::parse_anime_release("[SubsPlease] Title - 01 (1080p).mkv");
+        let bundle = PackageBundle {
+            torrent_path: PathBuf::from("dummy.torrent"),
+            torrent_info_hash: "hash".to_string(),
+            mediainfo_path: PathBuf::from("dummy.txt"),
+            mediainfo_text: "dummy".to_string(),
+            screenshots: vec![PathBuf::from("1.jpg"), PathBuf::from("2.jpg")], // only 2 screenshots
+            content_path: PathBuf::from("dummy.mkv"),
+            primary_video_path: PathBuf::from("dummy.mkv"),
+            total_size_bytes: 100,
+            file_count: 1,
+            piece_length: 262144,
+        };
+
+        let res = client.upload_release(&parsed, None, &bundle, false).await;
+        assert!(res.is_err());
+        let err_str = res.unwrap_err().to_string();
+        assert!(err_str.contains("strictly require a minimum of 6 screenshots"));
     }
 }

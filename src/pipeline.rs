@@ -228,9 +228,41 @@ impl Pipeline {
                 title = %record.raw_title,
                 "Stage 2: Resolving MAL metadata & checking duplicates on animez.to"
             );
+
+            // 1. Verify AnimeZ upload rule compliance (container, codecs, resolution, leaks)
+            if let Err(rule_err) = crate::parser::check_animez_rule_compliance(&parsed) {
+                info!(
+                    id = id,
+                    title = %record.raw_title,
+                    reason = %rule_err,
+                    "Release violates AnimeZ upload rules; marking SKIPPED"
+                );
+                let db_skip = self.db.clone();
+                tokio::task::spawn_blocking(move || db_skip.mark_skipped(id, &rule_err)).await??;
+                return Ok(());
+            }
+
             let mal_meta = self.jikan.resolve_mal(&parsed.clean_title).await?;
             let mal_id = mal_meta.as_ref().map(|m| m.mal_id).or(record.mal_id);
 
+            // 2. Check Ongoing Season Catch-Up Rule (AnimeZ Upload Rules Section 3)
+            if let Some(catchup_reason) = self
+                .dupe_checker
+                .check_ongoing_catchup_rule(&parsed, mal_id, &self.db)
+                .await?
+            {
+                info!(
+                    id = id,
+                    title = %record.raw_title,
+                    reason = %catchup_reason,
+                    "Skipping mid-season ongoing episode to comply with AnimeZ catch-up rules"
+                );
+                let db_skip = self.db.clone();
+                tokio::task::spawn_blocking(move || db_skip.mark_skipped(id, &catchup_reason)).await??;
+                return Ok(());
+            }
+
+            // 3. Remote duplicate check on animez.to
             let dupe = self
                 .dupe_checker
                 .check_remote_duplicate(&parsed, mal_id)

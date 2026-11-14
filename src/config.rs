@@ -200,8 +200,8 @@ impl Default for PackagerConfig {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             mediainfo_bin: "mediainfo".to_string(),
-            screenshot_count: 4,
-            screenshot_positions: vec![0.15, 0.35, 0.55, 0.75],
+            screenshot_count: 6,
+            screenshot_positions: vec![0.10, 0.25, 0.40, 0.55, 0.70, 0.85],
             screenshot_format: "jpg".to_string(),
             screenshot_quality: 2,
         }
@@ -244,6 +244,7 @@ pub struct AnimezConfig {
     pub user_agent: String,
     pub anonymous: bool,
     pub image_upload_mode: String,
+    pub enforce_ongoing_catchup: bool,
 }
 
 impl Default for AnimezConfig {
@@ -263,6 +264,7 @@ impl Default for AnimezConfig {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".to_string(),
             anonymous: false,
             image_upload_mode: "direct".to_string(),
+            enforce_ongoing_catchup: true,
         }
     }
 }
@@ -648,6 +650,10 @@ impl AppConfig {
                 self.packager.screenshot_count = n;
             }
         }
+        // AnimeZ upload rules (Section 6) strictly require a minimum of 6 screenshots for anime uploads
+        if self.packager.screenshot_count < 6 {
+            self.packager.screenshot_count = 6;
+        }
         if let Ok(v) = env::var("ZBRR_PACKAGER_SCREENSHOT_POSITIONS") {
             let list: Vec<f64> = v
                 .split(',')
@@ -656,6 +662,10 @@ impl AppConfig {
             if !list.is_empty() {
                 self.packager.screenshot_positions = list;
             }
+        }
+        // Ensure positions list matches at least screenshot_count
+        if self.packager.screenshot_positions.len() < self.packager.screenshot_count {
+            self.packager.screenshot_positions = vec![0.10, 0.25, 0.40, 0.55, 0.70, 0.85];
         }
         if let Ok(v) = env::var("ZBRR_PACKAGER_SCREENSHOT_FORMAT") {
             let fmt = v.trim().to_lowercase();
@@ -730,6 +740,11 @@ impl AppConfig {
         if let Ok(v) = env::var("ZBRR_ANIMEZ_IMAGE_UPLOAD_MODE") {
             if !v.is_empty() {
                 self.animez.image_upload_mode = v;
+            }
+        }
+        if let Ok(v) = env::var("ZBRR_ANIMEZ_ENFORCE_ONGOING_CATCHUP") {
+            if let Ok(b) = v.trim().parse::<bool>() {
+                self.animez.enforce_ongoing_catchup = b;
             }
         }
         // Auto-build announce_url from `pid` if announce_url is still a placeholder or default

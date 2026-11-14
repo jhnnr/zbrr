@@ -615,6 +615,11 @@ impl ProwlarrClient {
             }
         }
 
+        // AnimeZ rule compliance check (container, codecs, resolution, leaks)
+        if let Err(e) = crate::parser::check_animez_rule_compliance(parsed) {
+            return Err(e);
+        }
+
         Ok(())
     }
 }

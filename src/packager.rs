@@ -132,11 +132,18 @@ impl Packager {
         let mediainfo_path = bundle_dir.join("mediainfo.txt");
         fs::write(&mediainfo_path, &mediainfo_text)?;
 
-        // 3. Extract PNG screenshots
+        // 3. Extract screenshots (minimum 6 for anime per AnimeZ Upload Rules Section 6)
         let screenshots = if skip_screenshots {
             Vec::new()
         } else {
-            self.extract_screenshots(&primary_video, &bundle_dir).await?
+            let shots = self.extract_screenshots(&primary_video, &bundle_dir).await?;
+            if shots.len() < 6 {
+                anyhow::bail!(
+                    "Media packaging produced only {} screenshots; AnimeZ upload rules (Section 6) strictly require a minimum of 6 screenshots for anime uploads.",
+                    shots.len()
+                );
+            }
+            shots
         };
 
         Ok(PackageBundle {
@@ -236,12 +243,16 @@ impl Packager {
         output_dir: &Path,
     ) -> Result<Vec<PathBuf>> {
         let duration_secs = self.probe_video_duration(video_path).await.unwrap_or(1440.0);
-        let positions = if self.config.packager.screenshot_positions.is_empty() {
-            vec![0.15, 0.35, 0.55, 0.75]
+        let mut positions = if self.config.packager.screenshot_positions.is_empty() {
+            vec![0.10, 0.25, 0.40, 0.55, 0.70, 0.85]
         } else {
             self.config.packager.screenshot_positions.clone()
         };
-        let count = self.config.packager.screenshot_count.min(positions.len()).max(1);
+        // Ensure at least 6 positions for AnimeZ upload compliance
+        if positions.len() < 6 {
+            positions = vec![0.10, 0.25, 0.40, 0.55, 0.70, 0.85];
+        }
+        let count = self.config.packager.screenshot_count.max(6).min(positions.len());
 
         let ext = match self.config.packager.screenshot_format.as_str() {
             "png" => "png",
