@@ -90,24 +90,60 @@ flowchart TD
 
 ## Installation
 
-### 1. Build from Source
+### Option 1: Automated Installer (`install.sh`)
 
-Clone the repository and build the optimized release binary:
+The included installer compiles the release binary and copies it into your system `PATH`:
 
-```powershell
-# Clone the repository
-git clone https://github.com/jhnnr/zbrr.git
-cd zbrr
+```bash
+chmod +x install.sh
 
-# Build release binary
-cargo build --release
+# User install (installs to ~/.local/bin or /usr/local/bin if writable)
+./install.sh
+
+# System-wide install (installs to /usr/local/bin with sudo)
+./install.sh --system
+
+# Custom directory
+./install.sh --dir ~/.local/bin
 ```
 
-The compiled binary will be located at:
-- **Windows**: `target\release\zbrr.exe`
-- **Linux**: `target/release/zbrr`
+---
 
-*(Optional)* Copy the executable to a directory in your system `PATH`.
+### Option 2: Cargo Install (Idiomatic Rust)
+
+You can use `cargo install` directly from the repository root:
+
+```bash
+# Installs cleanly into ~/.cargo/bin/zbrr
+cargo install --path .
+
+# Or install system-wide into /usr/local/bin/zbrr
+sudo cargo install --path . --root /usr/local
+```
+
+---
+
+### Option 3: Manual Build & Copy
+
+```bash
+# 1. Build the optimized release binary
+cargo build --release
+
+# 2. Copy the binary to your PATH
+# Linux / macOS (System-wide):
+sudo install -m 755 target/release/zbrr /usr/local/bin/
+
+# Linux / macOS (User-only):
+mkdir -p ~/.local/bin && install -m 755 target/release/zbrr ~/.local/bin/
+
+# Windows (PowerShell - run as Administrator for system PATH):
+Copy-Item target\release\zbrr.exe C:\Windows\System32\zbrr.exe
+# or copy to your custom scripts folder in PATH (e.g. C:\Users\<user>\bin)
+```
+
+> [!WARNING]
+> **Do not use `cargo build --target-dir /usr/bin/`**:
+> The `--target-dir` flag tells Cargo where to store its entire intermediate build cache (`deps/`, `build/`, `.rlib`, and `.o` files), which would severely pollute `/usr/bin/` and outputs the binary at `/usr/bin/release/zbrr` rather than `/usr/bin/zbrr`. Always use `cargo install --path .` or copy the final binary with `install -m 755 target/release/zbrr /usr/local/bin/`.
 
 ---
 
