@@ -32,8 +32,8 @@ Usage: ./install.sh [OPTIONS]
 
 Options:
   -v, --version <tag>             Target version to install (default: latest release)
-  -d, --dir <path>, --prefix <path> Installation directory (default: /usr/local/bin or ~/.local/bin)
-  --system                        Force installation to /usr/local/bin (elevates with sudo if needed)
+  -d, --dir <path>, --prefix <path> Installation directory (default: /usr/bin)
+  --system                        Install to /usr/bin (elevates with sudo if needed)
   -h, --help                      Show this help message
 EOF
     exit 0
@@ -138,14 +138,8 @@ fi
 # 4. Determine installation directory
 if [ -n "$CUSTOM_DIR" ]; then
     INSTALL_DIR="$CUSTOM_DIR"
-elif [ "$SYSTEM_INSTALL" = true ]; then
-    INSTALL_DIR="/usr/local/bin"
 else
-    if [ -w "/usr/local/bin" ] || [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
-        INSTALL_DIR="/usr/local/bin"
-    else
-        INSTALL_DIR="$HOME/.local/bin"
-    fi
+    INSTALL_DIR="/usr/bin"
 fi
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 

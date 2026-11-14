@@ -125,7 +125,7 @@ The compiled binary will be located at:
 - **Windows**: `target\release\zbrr.exe`
 - **Linux**: `target/release/zbrr`
 
-*(Optional)* Copy the executable to a directory in your system `PATH` (such as `/usr/local/bin` or `~/.local/bin`).
+*(Optional)* Copy the executable to a directory in your system `PATH` (such as `/usr/bin` or `~/.local/bin`).
 
 ---
 
