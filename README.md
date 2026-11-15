@@ -21,21 +21,29 @@ DISCOVERED ──► DUPE_CHECKED ──► DOWNLOADING ──► PACKAGING ─�
 
 ```mermaid
 flowchart TD
+    subgraph StagingCheck ["1. Staging & Seeding Priority"]
+        S1["qBittorrent (animez-staging)"] -->|"Check Existing & Completed Downloads"| S2["Adopt & Prioritize directly to Packaging"]
+        S3["qBittorrent (animez-seeding)"] -->|"Track Active Seeding Series"| S4["Prioritize New Episodes for Active Shows"]
+    end
     A["Prowlarr (RSS / REST API)"] -->|"Poll Releases"| B["Discovery & Regex Filtering"]
     B -->|"Deduplicate by GUID / InfoHash"| C["SQLite State DB (~/.zbrr/state.db)"]
-    C -->|"Resolve MAL ID via Jikan v4"| D["Pre-Download Dupe Check"]
+    C -->|"Nyaa Info Scraper & Jikan v4"| D["Pre-Download Dupe Check & Section 3 Catch-Up"]
     D -->|"Duplicate Exists"| E["Mark SKIPPED"]
+    D -->|"Episode N > 1 (No Sequence)"| D2["Fetch Missing Prior Episodes 01~N-1 for Batch"]
     D -->|"Missing on Tracker"| F["qBittorrent (animez-staging)"]
+    D2 --> F
     F -->|"Poll until 100% Downloaded"| G["Media Packager"]
-    subgraph Packaging ["Local Packaging"]
+    S2 --> G
+    subgraph Packaging ["Local Media Packaging"]
         G --> H["Rayon Parallel .torrent (private=1, source=animez.to)"]
         G --> I["mediainfo CLI (Sanitized Complete Name)"]
-        G --> J["ffprobe + ffmpeg (SAR-scaled PNG Screenshots)"]
+        G --> J["ffprobe + ffmpeg (Stream Duration & Fallback Seek)"]
     end
     Packaging --> K["Pre-Upload Dupe Re-check"]
     K -->|"Race Dupe Detected"| E
     K --> L["FlareSolverr & animez.to HTTP Client"]
-    L -->|"Multipart POST (_token, .torrent, MediaInfo, Screenshots)"| M["Tracker Upload"]
+    L -->|"Import Anime if Missing (POST /anime)"| L2["AnimeZ Entry Resolution"]
+    L2 -->|"Multipart POST (_token, .torrent, MediaInfo, 6+ Screenshots)"| M["Tracker Upload"]
     M -->|"Download Re-signed .torrent"| N["Auto-Reseed Injection"]
     N -->|"qBittorrent (animez-seeding, skip_checking=true)"| O["Active Seeding"]
 ```
@@ -44,29 +52,33 @@ flowchart TD
 
 ## Features
 
-- **Prowlarr Integration**:
+- **Prowlarr Integration & Active Seeding Priority**:
   - Dynamically resolves indexers by friendly name (e.g. `Nyaa.si`, `1337x`) or numeric IDs via `/api/v1/indexer`.
   - Automatically detects the **AnimeZ** tracker indexer and excludes it from source release polling while using it for fast API duplicate checks.
   - Supports both REST API (`/api/v1/search`) and Torznab XML RSS feeds.
+  - **Active Seeding Series Priority**: Inspects active torrents in `animez-seeding` and prioritizes incoming episodes for series you are already seeding.
   - Granular filtering: include/exclude regex, release group whitelist, resolution, source media (`WEB-DL`, `BluRay`), video codec (`HEVC`, `H.264`), min seeders, and size bounds.
-- **Intelligent Deduplication**:
+- **Intelligent Deduplication & Catch-Up Batch Rules**:
   - Custom Anitopy-style anime filename tokenizer extracting titles, season/episode, batch indicators, codecs, audio, and CRC32.
-  - Resolves canonical MyAnimeList (MAL) metadata via Jikan v4 with local SQLite TTL caching.
+  - **Ongoing Series Catch-Up (Section 3 Rule)**: Enforces AnimeZ upload rules for ongoing shows. If an episode `N > 1` is discovered without an established upload sequence, `zbrr` automatically discovers missing prior episodes (`01 ~ N-1`), downloads them, and packages them into a complete batch (`01-N`).
+  - Resolves canonical MyAnimeList (MAL) metadata via Jikan v4 with local SQLite TTL caching and scrapes Nyaa `Information` links (e.g. Erai-raws anime list pages) for direct MAL link extraction.
   - Checks remote duplicates via Prowlarr AnimeZ indexer query and direct `animez.to/torrents` HTML scraping.
   - Double-checks duplicates right before upload to prevent race conditions during long downloads.
-- **qBittorrent WebUI v2 Management**:
+- **qBittorrent WebUI v2 Management & Staging Adoption**:
   - Stateless Bearer API key authentication (`Authorization: Bearer <api_key>`) for modern qBittorrent (v5.2.0+).
   - Categorizes staging downloads under `animez-staging`.
+  - **Staging Torrent Prioritization & Adoption**: Automatically detects and adopts completed torrents already in `animez-staging`, jumping them straight to packaging and seeding without re-downloading.
   - Preserves original source seeding and injects tracker-signed torrents under `animez-seeding` with `skip_checking=true`.
   - Docker/WSL/NAS path mapping (`remote_path_prefix` to `local_path_prefix`).
-- **High-Speed Media Packaging**:
+- **High-Speed & Resilient Media Packaging**:
   - **Multi-threaded Torrent Creator**: Hashes pieces in parallel across all CPU cores using `rayon` + `sha1`. Generates strict BitTorrent Bencode dictionary ordering, `private=1`, and `source="animez.to"`. Automatic power-of-two piece sizing (256 KiB to 16 MiB). Excludes OS junk (`Thumbs.db`, `.DS_Store`).
   - **MediaInfo Extractor**: Invokes `mediainfo` binary with direct argument escaping and strips local disk directories from `Complete name`.
-  - **SAR-Scaled Screenshots**: Uses `ffprobe` for duration and `ffmpeg` to extract full-resolution high-quality screenshots (JPEG by default, WebP/PNG supported) evenly spaced across video timestamps with aspect-ratio correction (`scale=iw*sar:ih`). Keeps multipart upload payload under 1.5 MB to avoid HTTP 413 limits.
-- **Cloudflare & Tracker Session Resilience**:
+  - **Robust Screenshot Generator**: Probes true video track duration via MediaInfo and ffprobe stream duration (`stream_dur.min(format_dur)`) to eliminate container duration overestimation. Implements multi-stage seek fallbacks (fast input seek, output seek, stepped earlier seeking) and an intermediate candidate position pool, guaranteeing the strict minimum of 6 screenshots required by AnimeZ upload rules.
+- **Cloudflare, Tracker Session & Auto-Import**:
   - Integrates with **FlareSolverr** to solve Cloudflare challenges on demand.
   - Caches `cf_clearance` and the exact matching `User-Agent` in `~/.zbrr/cookies.json`.
   - Automatically logs in via `animez.to/login` (extracting Laravel CSRF `_token`) if cookies expire or are missing.
+  - **Anime Entry Auto-Import**: If an anime entry is not yet indexed on AnimeZ, automatically creates and imports it via `POST /anime` using the canonical MAL ID.
   - Enforces polite request delays with configurable jitter (2–5 seconds).
 - **Safety First (`--dry-run` & `inspect-form`)**:
   - Safe dry-run mode executes discovery, duplicate checks, download, and local packaging without posting to the live tracker.
@@ -417,6 +429,34 @@ zbrr/
   ZBRR_QBITTORRENT_REMOTE_PATH_PREFIX=/downloads
   ZBRR_QBITTORRENT_LOCAL_PATH_PREFIX=F:\Downloads
   ```
+</details>
+
+<details>
+<summary><strong>5. How ongoing series catch-up (Section 3 rule) works</strong></summary>
+
+- Under AnimeZ Upload Rules (Section 3), if you upload an ongoing anime series mid-season, you cannot upload a standalone episode `N > 1` unless you have already established the upload sequence for earlier episodes.
+- `zbrr` automatically inspects your tracker upload history and local database:
+  - If prior episodes exist, the standalone episode `N` is uploaded normally.
+  - If no prior sequence exists, `zbrr` automatically queries Prowlarr for missing prior episodes (`01` through `N-1`), downloads all episodes into staging, and packages them together into a complete catch-up batch titled `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
+  - Future episodes (`N+1`) will then be uploaded individually each week as they become available.
+</details>
+
+<details>
+<summary><strong>6. Resuming or retrying failed packaging/upload without re-downloading</strong></summary>
+
+- If a release failed during packaging or uploading (for instance, due to temporary network issues or tracker maintenance), its media files remain stored on disk in qBittorrent.
+- You can retry the release by ID using the CLI:
+  ```powershell
+  # Check failed releases
+  zbrr status --state FAILED
+
+  # Queue release for next run cycle
+  zbrr retry <id>
+
+  # Or process immediately
+  zbrr retry <id> --now
+  ```
+- Because the media file exists in `animez-staging`, `zbrr` jumps straight to packaging and uploading without re-downloading the file.
 </details>
 
 ---

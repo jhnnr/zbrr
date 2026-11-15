@@ -18,14 +18,18 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
 ```
 
 ### Pipeline Stages
+0. **Staging Adoption & Active Seeding Priority (`pipeline.rs`)**
+   - Inspects qBittorrent before polling Prowlarr. Torrents already in `animez-staging` that are completed or untracked are adopted and prioritized straight into the packaging pipeline.
+   - Inspects `animez-seeding` to identify anime series currently seeding and prioritizes discovery/downloads for new episodes of those ongoing shows.
 1. **Discovery (`prowlarr.rs`)**
    - Resolves target indexers dynamically by name (`indexers = ["Nyaa.si"]`) or numeric ID (`indexer_ids`), automatically detecting the AnimeZ tracker ID and excluding it from source polling (`exclude_indexers = ["AnimeZ"]`).
    - Polls configured Prowlarr indexers via `/api/v1/search` (JSON) or Torznab RSS (`/1/api?t=rss` via `quick-xml`) with configurable categories and search queries.
    - Filters items by include/exclude regexes, release group whitelist, resolution, source media (`allowed_sources`), video codec (`allowed_codecs`), indexer exclusion, minimum seeders, and size bounds.
    - Deduplicates by GUID, infohash, and normalized release title in SQLite.
-2. **Pre-Download Dupe Check (`dupe_checker.rs` & `parser.rs`)**
+2. **Pre-Download Dupe Check & Catch-Up Batch Logic (`dupe_checker.rs` & `parser.rs`)**
    - Parses the anime release filename (extracting anime title, season/episode, resolution, source, video/audio codecs, and release group).
-   - Resolves the canonical **MyAnimeList (MAL) / AniDB / TVDB / IMDB ID** via Jikan API v4 (with local SQLite caching) or `animez.to`'s internal search autocomplete endpoint.
+   - Scrapes the canonical **MyAnimeList (MAL) link** directly from Nyaa's `Information` section (following Erai-raws anime list pages) or resolves via Jikan API v4 (with local SQLite caching).
+   - **AnimeZ Upload Rules (Section 3)**: Checks whether episode `N > 1` is standalone. If no prior sequence exists in local DB or tracker profile, searches Prowlarr for missing prior episodes (`01 ~ N-1`), downloads the full set, and schedules a complete catch-up batch (`01-N`).
    - Checks `animez.to` (via Prowlarr indexer query or direct HTTP search on `animez.to/torrents`) to verify whether the same episode/pack + resolution + group already exists. If it exists, marks status as `SKIPPED`.
 3. **Download Management (`qbittorrent.rs`)**
    - Authenticates statelessly with qBittorrent WebUI API using a Bearer API key (`Authorization: Bearer <api_key>`) and adds the `.torrent` file or magnet URI under a staging category (default: `animez-staging`) and tag (`animez-auto`).
@@ -33,7 +37,10 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
 4. **Media Packaging (`packager.rs` & `torrent_builder.rs`)**
    - Inspects the downloaded files on disk (ignoring OS junk files).
    - **MediaInfo**: Invokes the `mediainfo` CLI binary to extract clean raw text MediaInfo from the primary `.mkv`/`.mp4` file, stripping local filesystem paths from `Complete name`.
-   - **Screenshots**: Invokes `ffprobe` for duration and `ffmpeg` to extract a minimum of 6 high-quality JPEG screenshots (as strictly required by AnimeZ Upload Rules, see UPLOAD_RULES.md) at evenly spaced timestamps (e.g. 10%, 25%, 40%, 55%, 70%, 85% of duration), keeping multipart upload payload under tracker HTTP 413 limits.
+   - **Screenshots & Robust Seeking**:
+     - Probes video duration via MediaInfo video track (`--Inform="Video;%Duration%"`) and ffprobe stream duration (`-select_streams v:0 -show_entries stream=duration`), taking `stream_dur.min(format_dur)` to eliminate trailing container duration overestimation.
+     - Multi-stage seek fallbacks: fast input seek (`-ss <ts> -i <file>`), accurate output seek (`-i <file> -ss <ts>`), stepped earlier seeks (`90%`, `80%`, `70%`), and an expanded candidate position pool.
+     - Strictly guarantees a minimum of 6 high-quality screenshots (maximum 9) per AnimeZ Upload Rules.
    - **Fast Multi-Threaded Torrent Creation (`torrent_builder.rs`)**:
      - Uses `rayon` + `sha1` + `serde_bencode` to hash pieces in parallel across CPU cores and generate a brand-new `.torrent` file directly from the downloaded disk payload with:
        - `info.private = 1`
@@ -44,6 +51,7 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
    - Uses `reqwest` (with `cookies`, `multipart`, `gzip`, and `rustls-tls`) synchronized with session cookies (`animez_session`, `XSRF-TOKEN`, `remember_web_*`, `cf_clearance`) and exact `User-Agent` matching.
    - Calls **FlareSolverr** (`POST http://localhost:8191/v1`) only when initializing a session or when Cloudflare returns a `403`/`503` challenge, caching valid cookies and `User-Agent` on disk (`~/.zbrr/cookies.json`).
    - Automatically logs into `animez.to/login` using `ZBRR_ANIMEZ_USERNAME` and `ZBRR_ANIMEZ_PASSWORD` (extracting the Laravel `_token` CSRF token) whenever the cached session is missing or expired, persisting the resulting session cookies to `~/.zbrr/cookies.json`.
+   - **Anime Entry Auto-Import**: If the anime is not yet indexed on AnimeZ, automatically creates and imports it via `POST /anime` using the canonical MAL ID and CSRF token.
    - Executes `animez.to`'s multi-step Laravel upload flow (extracting CSRF `_token` from HTML via `scraper`), uploading screenshots, MediaInfo, metadata tags, and the `.torrent` file.
 6. **Auto-Reseed (`qbittorrent.rs`)**
    - Downloads the newly published `.torrent` file returned by `animez.to` (which carries the tracker's official PID/passkey and infohash).
@@ -66,7 +74,7 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
 ## 4. Target Directory Layout
 
 ```text
-F:\Dev Stuff\AnimeZ\
+F:\Dev Stuff\zbrr\
 ├── AGENTS.md
 ├── CLAUDE.md
 ├── Cargo.toml
@@ -118,7 +126,15 @@ F:\Dev Stuff\AnimeZ\
 7. **Strict AnimeZ Naming Conventions:**
    - Never upload raw scene or indexer release filenames (e.g. `[Group] Title - S01E07 [1080p NF WEBRip HEVC AAC][MultiSub][CRC]`).
    - Titles must strictly conform to AnimeZ's naming guide (`https://animez.to/guides/how-to-properly-titlename-a-torrent`): `[AniDB Main Title] - [Episode] (Year) [Fansub] [Additional Tags...]` without resolutions, rip types, audio codecs, or CRC hashes, retaining only permitted tags (`[Dual Audio]`, `[Multi Audio]`, `[English Dubbed]`, `[RAW]`, `[HDR10]`, `[HEVC]`, `[10-bit]`).
+   - Avoid double-year redundancy (e.g. `Ranma 1/2 (2024) - 01 (2026)` instead of `(2026) ... (2026)`).
 8. **Anime Screenshot Requirement (Minimum 6):**
    - Anime uploads strictly require a minimum of 6 screenshots (maximum 9). The packager, pipeline, and uploader must validate that at least 6 screenshots exist and abort before uploading if fewer than 6 were generated.
-9. **Ongoing Series Catch-Up Rule:**
-   - Per Section 3 of AnimeZ Upload Rules, standalone single episodes with `episode > 1` cannot be uploaded mid-season unless the user has established a prior sequence (having uploaded prior episodes in local DB or tracker profile) or uploads a catch-up batch of all episodes to date (`01~N`). Standalone mid-season episodes without prior sequence must be marked `SKIPPED`.
+   - Always probe true video track duration via MediaInfo and ffprobe stream duration (`stream_dur.min(format_dur)`) to avoid container duration overestimation past EOF.
+   - Employ multi-stage seek fallbacks (fast input seek, accurate output seek, stepped earlier seeking) and an intermediate candidate pool so single timestamp misses never crash release packaging.
+9. **Ongoing Series Catch-Up Rule & Batching:**
+   - Per Section 3 of AnimeZ Upload Rules, standalone single episodes with `episode > 1` cannot be uploaded mid-season unless the user has established a prior sequence (having uploaded prior episodes in local DB or tracker profile) or uploads a catch-up batch of all episodes to date (`01~N`).
+   - When no prior sequence exists, `zbrr` automatically searches Prowlarr for missing prior episodes (`01` through `N-1`), downloads the complete set, and packages them into a batch upload titled `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
+10. **Anime Entry Auto-Import & Season Matching:**
+    - Never upload a Season 2 release under a Season 1 anime entry on `animez.to`. If the specific season entry is missing on AnimeZ, resolve the canonical MAL ID (scraped from Nyaa `Information` or via Jikan) and trigger AnimeZ's auto-import endpoint (`POST /anime`) with CSRF tokens before completing upload.
+11. **Staging Priority & Untracked Torrent Adoption:**
+    - Prioritize completed torrents already resting in `animez-staging` before starting new Prowlarr downloads. If an untracked completed torrent exists in staging, adopt it into SQLite and proceed directly to packaging.

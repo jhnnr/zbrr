@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (and other AI coding assistants) when working with the Rust codebase in `F:\Dev Stuff\AnimeZ`.
+This file provides guidance to Claude Code (and other AI coding assistants) when working with the Rust codebase in `F:\Dev Stuff\zbrr`.
 
 Read [AGENTS.md](./AGENTS.md) first for the full system architecture, pipeline state machine, and private-tracker safety rules.
 
@@ -9,8 +9,8 @@ Read [AGENTS.md](./AGENTS.md) first for the full system architecture, pipeline s
 ## Quick Context
 
 - **Language & Stack:** Rust (2021 edition, `tokio` async runtime, `reqwest`, `rusqlite` bundled, `clap`, `scraper`, `serde_bencode`, `rayon`, `sha1`).
-- **Goal:** Automate grabbing anime releases (`.torrent` & magnet links) from a **Prowlarr** server, downloading them in **qBittorrent**, packaging them (parallel `.torrent` creation, MediaInfo via `mediainfo` CLI, PNG screenshots via `ffmpeg`, metadata via filename parser + Jikan/MAL), uploading to **animez.to** via direct HTTP + **FlareSolverr** + session cookies, and injecting the tracker's re-signed `.torrent` back into qBittorrent for immediate seeding.
-- **OS Environment:** Windows (`F:\Dev Stuff\AnimeZ`). Always use `std::path::{Path, PathBuf}` so Windows drive letters and paths are handled cleanly across qBittorrent, `ffmpeg`, and `serde_bencode`.
+- **Goal:** Automate grabbing anime releases (`.torrent` & magnet links) from a **Prowlarr** server, downloading them in **qBittorrent**, packaging them (parallel `.torrent` creation, MediaInfo via `mediainfo` CLI, robust high-quality screenshots via `ffmpeg`, metadata via filename parser + Nyaa/Jikan MAL resolution), uploading to **animez.to** via direct HTTP + **FlareSolverr** + session cookies, and injecting the tracker's re-signed `.torrent` back into qBittorrent for immediate seeding.
+- **OS Environment:** Windows (`F:\Dev Stuff\zbrr`). Always use `std::path::{Path, PathBuf}` so Windows drive letters and paths are handled cleanly across qBittorrent, `ffmpeg`, and `serde_bencode`.
 
 ---
 
@@ -102,6 +102,24 @@ ZBRR_ANIMEZ_PID=your_animez_pid_here
    - Each release moves through the SQLite state machine (`DISCOVERED` -> `DUPE_CHECKED` -> `DOWNLOADING` -> `PACKAGING` -> `UPLOADING` -> `SEEDING`).
    - Isolate per-release errors with `anyhow::Result` so a single failed torrent marks that row as `FAILED` with `error_message` in SQLite without crashing the daemon loop.
    - Wrap blocking `rusqlite` or `rayon` hashing calls in `tokio::task::spawn_blocking` when called from async contexts.
+
+5. **Accurate Duration Probing & Resilient Screenshot Seeking (`packager.rs`):**
+   - Container `format=duration` can be heavily skewed by chapter metadata, trailing container tags, or silent audio padding. Always probe `mediainfo --Inform="Video;%Duration%"` and `ffprobe stream=duration` for the primary video track, taking `stream_dur.min(format_dur)`.
+   - Implement multi-stage seek fallbacks for every screenshot: fast input seek (`-ss <ts> -i`), accurate output seek (`-i -ss <ts>`), and stepped earlier timestamps (`0.90x`, `0.80x`, `0.70x`).
+   - Use a rich candidate position pool (`10%`, `25%`, `40%`, `55%`, `70%`, `85%`, plus fallback pool `18%`, `33%`, `48%`, etc.) to guarantee AnimeZ's strict 6-screenshot minimum without aborting when sparse keyframes or timestamps near EOF miss.
+
+6. **Ongoing Series Catch-Up & Batch Creation (`dupe_checker.rs` & `parser.rs`):**
+   - Strictly obey AnimeZ Section 3 upload rules. If a release is a mid-season standalone episode (`N > 1`) and the user has not established a sequence, search Prowlarr for missing prior episodes (`01 ~ N-1`), download them into staging, and package as a complete batch `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
+   - Prevent double-year redundancy in generated torrent titles (e.g. `Ranma 1/2 (2024) - 01 (2026)` instead of `(2026) ... (2026)`).
+
+7. **AnimeZ Auto-Import & Nyaa Information Link Scraper (`animez_client.rs` & `parser.rs`):**
+   - For torrents found on Nyaa, inspect the `Information` link (e.g., Erai-raws anime list page) to obtain the canonical MyAnimeList URL.
+   - Auto-import the anime on `animez.to` via `POST /anime` (using CSRF tokens) if it is missing from the tracker database before uploading.
+   - Ensure strict season matching: never upload Season 2 under a Season 1 anime entry.
+
+8. **Staging Adoption & Active Seeding Series Priority (`pipeline.rs`):**
+   - Check `animez-staging` before starting new Prowlarr downloads. Completed staging downloads must be adopted into SQLite and prioritized straight into the packaging pipeline.
+   - Prioritize incoming episodes for anime series currently seeding in `animez-seeding`.
 
 ---
 
