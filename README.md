@@ -61,12 +61,15 @@ flowchart TD
 - **Intelligent Deduplication & Catch-Up Batch Rules**:
   - Custom Anitopy-style anime filename tokenizer extracting titles, season/episode, batch indicators, codecs, audio, and CRC32.
   - **Ongoing Series Catch-Up (Section 3 Rule)**: Enforces AnimeZ upload rules for ongoing shows. If an episode `N > 1` is discovered without an established upload sequence, `zbrr` automatically discovers missing prior episodes (`01 ~ N-1`), downloads them, and packages them into a complete batch (`01-N`).
-  - Resolves canonical MyAnimeList (MAL) metadata via Jikan v4 with local SQLite TTL caching and scrapes Nyaa `Information` links (e.g. Erai-raws anime list pages) for direct MAL link extraction.
+  - **Multi-Source Canonical MAL & AniDB Resolver**: Automatically resolves the canonical MyAnimeList ID and AniDB links by checking release `info_url`, GUID links, rewriting `nyaa.si/download/<id>` to `nyaa.si/view/<id>`, falling back to Nyaa search (`find_nyaa_view_url`) for title queries, following fansub `Information:` links (such as Erai-raws anime list pages), or querying Jikan v4 with SQLite caching.
+  - **Dynamic Stage 2 & Stage 5 Link Resolution**: Ensures that even if a release was queued before metadata was scraped or was resumed at packaging/upload stages, `zbrr` dynamically resolves the canonical MAL ID and persists it via `update_mal_id` without resetting the release state machine.
   - Checks remote duplicates via Prowlarr AnimeZ indexer query and direct `animez.to/torrents` HTML scraping.
   - Double-checks duplicates right before upload to prevent race conditions during long downloads.
 - **qBittorrent WebUI v2 Management & Staging Adoption**:
   - Stateless Bearer API key authentication (`Authorization: Bearer <api_key>`) for modern qBittorrent (v5.2.0+).
   - Categorizes staging downloads under `animez-staging`.
+  - **Automatic Prowlarr Download Authentication**: Automatically appends Prowlarr API keys (`?apikey=...`) to Prowlarr torrent download URLs before sending them to qBittorrent, preventing HTTP 401 Unauthorized errors when fetching unauthenticated indexer files.
+  - **Active Registration Polling & Fast-Fail**: Immediately polls qBittorrent after adding a torrent to confirm registration in the transfer list, failing fast with a 30s timeout rather than hanging indefinitely if qBittorrent rejects a payload.
   - **Staging Torrent Prioritization & Adoption**: Automatically detects and adopts completed torrents already in `animez-staging`, jumping them straight to packaging and seeding without re-downloading.
   - Preserves original source seeding and injects tracker-signed torrents under `animez-seeding` with `skip_checking=true`.
   - Docker/WSL/NAS path mapping (`remote_path_prefix` to `local_path_prefix`).
@@ -74,11 +77,11 @@ flowchart TD
   - **Multi-threaded Torrent Creator**: Hashes pieces in parallel across all CPU cores using `rayon` + `sha1`. Generates strict BitTorrent Bencode dictionary ordering, `private=1`, and `source="animez.to"`. Automatic power-of-two piece sizing (256 KiB to 16 MiB). Excludes OS junk (`Thumbs.db`, `.DS_Store`).
   - **MediaInfo Extractor**: Invokes `mediainfo` binary with direct argument escaping and strips local disk directories from `Complete name`.
   - **Robust Screenshot Generator**: Probes true video track duration via MediaInfo and ffprobe stream duration (`stream_dur.min(format_dur)`) to eliminate container duration overestimation. Implements multi-stage seek fallbacks (fast input seek, output seek, stepped earlier seeking) and an intermediate candidate position pool, guaranteeing the strict minimum of 6 screenshots required by AnimeZ upload rules.
-- **Cloudflare, Tracker Session & Auto-Import**:
+- **Cloudflare, Tracker Session & Resilient Auto-Import**:
   - Integrates with **FlareSolverr** to solve Cloudflare challenges on demand.
   - Caches `cf_clearance` and the exact matching `User-Agent` in `~/.zbrr/cookies.json`.
   - Automatically logs in via `animez.to/login` (extracting Laravel CSRF `_token`) if cookies expire or are missing.
-  - **Anime Entry Auto-Import**: If an anime entry is not yet indexed on AnimeZ, automatically creates and imports it via `POST /anime` using the canonical MAL ID.
+  - **Anime Entry Auto-Import & Draft Fallback**: If an anime entry is not yet indexed on AnimeZ, automatically creates and imports it via `POST /anime` using the canonical MAL ID. If draft publishing encounters an unindexed title, it queries Nyaa to find MAL/AniDB links and triggers auto-import on the fly before finalizing the upload.
   - Enforces polite request delays with configurable jitter (2–5 seconds).
 - **Safety First (`--dry-run` & `inspect-form`)**:
   - Safe dry-run mode executes discovery, duplicate checks, download, and local packaging without posting to the live tracker.
