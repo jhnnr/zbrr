@@ -217,6 +217,15 @@ impl Pipeline {
     /// Drives a single `ReleaseRecord` forward from its current state until `SEEDING` or `SKIPPED`.
     async fn advance_release(&self, mut record: ReleaseRecord, dry_run: bool) -> Result<()> {
         let id = record.id;
+        // Refresh latest record state from DB in case it was updated/skipped in this cycle
+        let db_refresh = self.db.clone();
+        if let Some(latest) = tokio::task::spawn_blocking(move || db_refresh.get_release_by_id(id)).await?? {
+            record = latest;
+        }
+        if record.state == ReleaseState::Skipped || record.state == ReleaseState::Seeding {
+            return Ok(());
+        }
+
         let parsed = record.parsed()?;
 
         // ---------------------------------------------------------------------
@@ -289,10 +298,22 @@ impl Pipeline {
                 // Immediately find and advance the earliest actionable release (Episode 01 or batch) to download
                 let db_find = self.db.clone();
                 let clean_title = parsed.clean_title.clone();
-                let earliest_rec = tokio::task::spawn_blocking(move || {
+                let mut earliest_rec = tokio::task::spawn_blocking(move || {
                     db_find.find_earliest_actionable_release_for_anime(&clean_title, mal_id)
                 })
                 .await??;
+
+                if earliest_rec.is_none() {
+                    let db_starter = self.db.clone();
+                    let title_clone = parsed.clean_title.clone();
+                    earliest_rec = tokio::task::spawn_blocking(move || {
+                        db_starter.find_and_unskip_starter_for_anime(&title_clone, mal_id)
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                }
 
                 if let Some(starter_rec) = earliest_rec {
                     let starter_id = starter_rec.id;
@@ -302,7 +323,7 @@ impl Pipeline {
                         p.episode.is_some_and(|ep| ep <= 1) || p.is_season_pack
                     });
 
-                    if is_starter {
+                    if is_starter && starter_id != id {
                         info!(
                             starter_id = starter_id,
                             parent_id = id,
@@ -320,6 +341,8 @@ impl Pipeline {
                             let db_err = self.db.clone();
                             let _ = tokio::task::spawn_blocking(move || db_err.mark_failed(starter_id, &err_msg)).await;
                         }
+                    } else if is_starter && starter_id == id {
+                        // Already the starter release being processed
                     } else {
                         info!(
                             earliest_id = starter_id,
@@ -726,12 +749,38 @@ impl Pipeline {
             let guid = item.guid.clone();
             let info_hash = item.info_hash.clone();
             let norm_key = cand_parsed.normalized_key.clone();
+            let key_for_check = norm_key.clone();
             let is_dupe = tokio::task::spawn_blocking(move || {
-                db_check.is_duplicate_in_db(&guid, info_hash.as_deref(), &norm_key)
+                db_check.is_duplicate_in_db(&guid, info_hash.as_deref(), &key_for_check)
             })
             .await??;
 
             if is_dupe {
+                // If it's already in DB, check if it's currently SKIPPED but is a starter (episode <= 1 or batch).
+                // If so, unskip it so it can be downloaded and used as catch-up!
+                let db_existing = self.db.clone();
+                let key_clone = norm_key.clone();
+                if let Ok(Some(rec)) = tokio::task::spawn_blocking(move || {
+                    db_existing.get_release_by_normalized_key(&key_clone)
+                })
+                .await?
+                {
+                    let is_starter = cand_parsed.is_season_pack
+                        || cand_parsed.episode.is_some_and(|ep| ep <= 1);
+                    if is_starter && rec.state == ReleaseState::Skipped {
+                        let db_reset = self.db.clone();
+                        let rec_id = rec.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            db_reset.update_state(rec_id, ReleaseState::Discovered)
+                        })
+                        .await;
+                        info!(
+                            id = rec_id,
+                            title = %rec.raw_title,
+                            "Unskipped previously SKIPPED catch-up starter release to DISCOVERED state"
+                        );
+                    }
+                }
                 continue;
             }
 
@@ -880,6 +929,99 @@ impl Pipeline {
         } else {
             println!("  [INFO] No AnimeZ credentials or cached cookies in {} yet (configure ZBRR_ANIMEZ_USERNAME, ZBRR_ANIMEZ_PASSWORD, and ZBRR_ANIMEZ_PID in .env).", self.config.flaresolverr.cookies_file.display());
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_anime_release;
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_catchup_earliest_starter_selection_and_unskip() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Database::open(dir.path().join("test.db"))?;
+
+        // 1. Insert Episode 03 first (gets id 1)
+        let item3 = DiscoveredRelease {
+            guid: "https://nyaa.si/view/3".to_string(),
+            title: "[Erai-raws] Kyoufu Collector - 03 [1080p CR WEB-DL AVC AAC][MultiSub][AC2E912E]".to_string(),
+            indexer_id: 8,
+            indexer_name: "Nyaa.si".to_string(),
+            download_url: Some("https://nyaa.si/download/3.torrent".to_string()),
+            magnet_url: None,
+            info_hash: Some("3333333333333333333333333333333333333333".to_string()),
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 1,
+            publish_date: Some(Utc::now()),
+        };
+        let p3 = parse_anime_release(&item3.title);
+        let id3 = db.insert_discovered(&item3, &p3)?;
+        assert_eq!(id3, 1);
+
+        // 2. Insert Episode 04 second (gets id 2)
+        let item4 = DiscoveredRelease {
+            guid: "https://nyaa.si/view/4".to_string(),
+            title: "[Erai-raws] Kyoufu Collector - 04 [1080p CR WEB-DL AVC AAC][MultiSub][E88B6B75]".to_string(),
+            indexer_id: 8,
+            indexer_name: "Nyaa.si".to_string(),
+            download_url: Some("https://nyaa.si/download/4.torrent".to_string()),
+            magnet_url: None,
+            info_hash: Some("4444444444444444444444444444444444444444".to_string()),
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 1,
+            publish_date: Some(Utc::now()),
+        };
+        let p4 = parse_anime_release(&item4.title);
+        let id4 = db.insert_discovered(&item4, &p4)?;
+        assert_eq!(id4, 2);
+
+        // 3. Insert Episode 01 third (gets id 3, higher ID than 1 and 2!)
+        let item1 = DiscoveredRelease {
+            guid: "https://nyaa.si/view/1".to_string(),
+            title: "[Erai-raws] Kyoufu Collector - 01 [1080p CR WEB-DL AVC AAC][MultiSub][A93A1C78]".to_string(),
+            indexer_id: 8,
+            indexer_name: "Nyaa.si".to_string(),
+            download_url: Some("https://nyaa.si/download/1.torrent".to_string()),
+            magnet_url: None,
+            info_hash: Some("1111111111111111111111111111111111111111".to_string()),
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 1,
+            publish_date: Some(Utc::now()),
+        };
+        let p1 = parse_anime_release(&item1.title);
+        let id1 = db.insert_discovered(&item1, &p1)?;
+        assert_eq!(id1, 3);
+
+        // find_earliest_actionable_release_for_anime MUST return Episode 01 (id 3) despite having higher SQLite id
+        let earliest = db.find_earliest_actionable_release_for_anime("Kyoufu Collector", None)?;
+        assert!(earliest.is_some());
+        let earliest_rec = earliest.unwrap();
+        assert_eq!(earliest_rec.id, id1);
+        let parsed_earliest = earliest_rec.parsed()?;
+        assert_eq!(parsed_earliest.episode, Some(1));
+
+        // get_actionable_releases MUST also return Episode 01 first
+        let actionable = db.get_actionable_releases(10)?;
+        assert_eq!(actionable[0].id, id1);
+
+        // If Episode 01 was previously marked SKIPPED, find_and_unskip_starter_for_anime rescues it
+        db.mark_skipped(id1, "AnimeZ catch-up: missing prior sequence")?;
+        let rec1 = db.get_release_by_id(id1)?.unwrap();
+        assert_eq!(rec1.state, ReleaseState::Skipped);
+
+        let unskipped = db.find_and_unskip_starter_for_anime("Kyoufu Collector", None)?;
+        assert!(unskipped.is_some());
+        assert_eq!(unskipped.unwrap().id, id1);
+        let rec1_rescued = db.get_release_by_id(id1)?.unwrap();
+        assert_eq!(rec1_rescued.state, ReleaseState::Discovered);
 
         Ok(())
     }

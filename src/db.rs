@@ -353,15 +353,44 @@ impl Database {
                     ELSE 6
                 END ASC,
                 id ASC
-            LIMIT ?1
             "#,
         )?;
-        let rows = stmt.query_map(params![limit as i64], Self::map_row)?;
+        let rows = stmt.query_map([], Self::map_row)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
+
+        // Sort so that active in-flight states come first, and for DISCOVERED,
+        // batches and lower episode numbers come before higher episode numbers:
+        out.sort_by_key(|r| {
+            let state_rank = match r.state {
+                ReleaseState::Uploading => 1,
+                ReleaseState::Packaging => 2,
+                ReleaseState::Downloading => 3,
+                ReleaseState::DupeChecked => 4,
+                ReleaseState::Discovered => 5,
+                _ => 6,
+            };
+            let parsed = r.parsed().ok();
+            let is_pack = parsed.as_ref().map(|p| p.is_season_pack).unwrap_or(false);
+            let ep = parsed.as_ref().and_then(|p| p.episode).unwrap_or(u32::MAX);
+            (state_rank, if is_pack { 0 } else { 1 }, ep, r.id)
+        });
+
+        out.truncate(limit);
         Ok(out)
+    }
+
+    pub fn get_release_by_normalized_key(&self, key: &str) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT * FROM releases WHERE normalized_key = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![key], Self::map_row)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Resets a FAILED or SKIPPED release back to the appropriate stage for retrying.
@@ -554,6 +583,8 @@ impl Database {
             .collect::<Vec<_>>()
             .join("_");
 
+        let mut candidates: Vec<ReleaseRecord> = Vec::new();
+
         // 1. Check by MAL ID if present
         if let Some(mid) = mal_id {
             let mut stmt = conn.prepare(
@@ -561,50 +592,132 @@ impl Database {
                 SELECT * FROM releases
                 WHERE state IN ('DISCOVERED', 'DUPE_CHECKED', 'DOWNLOADING', 'PACKAGING', 'UPLOADING')
                   AND mal_id = ?1
-                ORDER BY
-                    CASE state
-                        WHEN 'UPLOADING' THEN 1
-                        WHEN 'PACKAGING' THEN 2
-                        WHEN 'DOWNLOADING' THEN 3
-                        WHEN 'DUPE_CHECKED' THEN 4
-                        WHEN 'DISCOVERED' THEN 5
-                        ELSE 6
-                    END ASC,
-                    id ASC
-                LIMIT 1
                 "#,
             )?;
-            let mut rows = stmt.query_map(params![mid as i64], Self::map_row)?;
-            if let Some(row) = rows.next() {
-                return Ok(Some(row?));
+            let rows = stmt.query_map(params![mid as i64], Self::map_row)?;
+            for r in rows {
+                candidates.push(r?);
             }
         }
 
-        // 2. Check by normalized prefix
-        if !norm_prefix.is_empty() {
+        // 2. Check by normalized prefix if empty
+        if candidates.is_empty() && !norm_prefix.is_empty() {
             let like_pat = format!("{norm_prefix}%");
             let mut stmt = conn.prepare(
                 r#"
                 SELECT * FROM releases
                 WHERE state IN ('DISCOVERED', 'DUPE_CHECKED', 'DOWNLOADING', 'PACKAGING', 'UPLOADING')
                   AND normalized_key LIKE ?1
-                ORDER BY
-                    CASE state
-                        WHEN 'UPLOADING' THEN 1
-                        WHEN 'PACKAGING' THEN 2
-                        WHEN 'DOWNLOADING' THEN 3
-                        WHEN 'DUPE_CHECKED' THEN 4
-                        WHEN 'DISCOVERED' THEN 5
-                        ELSE 6
-                    END ASC,
-                    id ASC
-                LIMIT 1
                 "#,
             )?;
-            let mut rows = stmt.query_map(params![like_pat], Self::map_row)?;
-            if let Some(row) = rows.next() {
-                return Ok(Some(row?));
+            let rows = stmt.query_map(params![like_pat], Self::map_row)?;
+            for r in rows {
+                candidates.push(r?);
             }
+        }
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // Sort candidates so the true earliest release comes first:
+        // 1. Season packs / batches come first (is_season_pack == true -> 0, else 1)
+        // 2. Lowest episode number (1, 2, 3...)
+        // 3. Furthest pipeline stage (UPLOADING > PACKAGING > DOWNLOADING > DUPE_CHECKED > DISCOVERED)
+        // 4. Lowest id
+        candidates.sort_by_key(|r| {
+            let parsed = r.parsed().ok();
+            let is_pack = parsed.as_ref().map(|p| p.is_season_pack).unwrap_or(false);
+            let ep = parsed.as_ref().and_then(|p| p.episode).unwrap_or(u32::MAX);
+            let state_rank = match r.state {
+                ReleaseState::Uploading => 1,
+                ReleaseState::Packaging => 2,
+                ReleaseState::Downloading => 3,
+                ReleaseState::DupeChecked => 4,
+                ReleaseState::Discovered => 5,
+                _ => 6,
+            };
+            (if is_pack { 0 } else { 1 }, ep, state_rank, r.id)
+        });
+
+        Ok(candidates.into_iter().next())
+    }
+
+    /// If no actionable release is pending, checks if a starter (batch or episode <= 1)
+    /// was previously SKIPPED and un-skips it back to DISCOVERED state.
+    pub fn find_and_unskip_starter_for_anime(
+        &self,
+        clean_title: &str,
+        mal_id: Option<u64>,
+    ) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let mut candidates: Vec<ReleaseRecord> = Vec::new();
+        if let Some(mid) = mal_id {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT * FROM releases
+                WHERE state = 'SKIPPED'
+                  AND mal_id = ?1
+                "#,
+            )?;
+            let rows = stmt.query_map(params![mid as i64], Self::map_row)?;
+            for r in rows {
+                candidates.push(r?);
+            }
+        }
+
+        if candidates.is_empty() && !norm_prefix.is_empty() {
+            let like_pat = format!("{norm_prefix}%");
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT * FROM releases
+                WHERE state = 'SKIPPED'
+                  AND normalized_key LIKE ?1
+                "#,
+            )?;
+            let rows = stmt.query_map(params![like_pat], Self::map_row)?;
+            for r in rows {
+                candidates.push(r?);
+            }
+        }
+
+        let mut starters: Vec<ReleaseRecord> = candidates
+            .into_iter()
+            .filter(|r| {
+                if let Ok(p) = r.parsed() {
+                    p.is_season_pack || p.episode.is_some_and(|ep| ep <= 1)
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        starters.sort_by_key(|r| {
+            let parsed = r.parsed().ok();
+            let is_pack = parsed.as_ref().map(|p| p.is_season_pack).unwrap_or(false);
+            let ep = parsed.as_ref().and_then(|p| p.episode).unwrap_or(u32::MAX);
+            (if is_pack { 0 } else { 1 }, ep, r.id)
+        });
+
+        if let Some(starter) = starters.into_iter().next() {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE releases SET state = 'DISCOVERED', error_message = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, starter.id],
+            )?;
+            let mut unskipped = starter;
+            unskipped.state = ReleaseState::Discovered;
+            unskipped.error_message = None;
+            return Ok(Some(unskipped));
         }
 
         Ok(None)
