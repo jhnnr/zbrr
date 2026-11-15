@@ -1,6 +1,6 @@
 [package]
 name = "zbrr"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Automated Prowlarr-to-AnimeZ.to RSS/API release pipeline"
 authors = ["AnimeZ Contributors"]
