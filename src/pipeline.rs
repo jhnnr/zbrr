@@ -534,6 +534,31 @@ impl Pipeline {
                 self.qbit
                     .inject_seeding_torrent(seed_torrent_path, save_path)
                     .await?;
+
+                // Delete the original staging torrent from qBittorrent (keep downloaded media files intact on disk)
+                if let Some(source_hash) = record.source_info_hash.as_deref() {
+                    let is_different = upload_res
+                        .downloaded_tracker_torrent_path
+                        .as_ref()
+                        .map(|_| true)
+                        .unwrap_or(true);
+
+                    if is_different {
+                        info!(
+                            id = id,
+                            hash = source_hash,
+                            "Deleting original staging torrent from qBittorrent (keeping media files intact)"
+                        );
+                        if let Err(e) = self.qbit.delete_torrent(source_hash).await {
+                            warn!(
+                                id = id,
+                                hash = source_hash,
+                                error = %e,
+                                "Failed to delete original staging torrent from qBittorrent"
+                            );
+                        }
+                    }
+                }
             }
 
             let db_seed = self.db.clone();

@@ -488,13 +488,13 @@ impl AnimezClient {
 
     fn extract_form_errors(html: &str) -> String {
         let doc = Html::parse_document(html);
-        if let Ok(sel) =
-            Selector::parse(".alert-danger, .invalid-feedback, .text-danger, ul.errors li")
-        {
+        if let Ok(sel) = Selector::parse(
+            ".alert-danger, .invalid-feedback, .text-danger, ul.errors li, .alert, div[role='alert']",
+        ) {
             let mut msgs = Vec::new();
             for el in doc.select(&sel) {
                 let t = el.text().collect::<String>().trim().to_string();
-                if !t.is_empty() && !msgs.contains(&t) {
+                if !t.is_empty() && !msgs.contains(&t) && !t.eq_ignore_ascii_case("×") {
                     msgs.push(t);
                 }
             }
@@ -502,7 +502,7 @@ impl AnimezClient {
                 return msgs.join("; ");
             }
         }
-        "Unknown tracker form validation error".to_string()
+        "Tracker rejected upload and redirected back to upload page".to_string()
     }
 
     fn extract_username_field_name(html: &str) -> String {
@@ -948,16 +948,19 @@ impl AnimezClient {
             );
         }
 
-        let animez_title = self
-            .lookup_anime_title(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+        let animez_entry = self
+            .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
             .await
             .ok()
             .flatten();
 
+        let anime_id = animez_entry.as_ref().map(|(id, _)| *id);
+        let animez_title = animez_entry.as_ref().map(|(_, t)| t.as_str());
+
         let torrent_name = crate::parser::format_animez_torrent_title(
             parsed,
             mal,
-            animez_title.as_deref(),
+            animez_title,
         );
 
         if dry_run || self.config.general.dry_run {
@@ -1030,6 +1033,14 @@ impl AnimezClient {
             .text("mediainfo", bundle.mediainfo_text.clone())
             .text("description", description)
             .text(
+                "is_anonymous",
+                if self.config.animez.anonymous {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
+            .text(
                 "anonymous",
                 if self.config.animez.anonymous {
                     "1"
@@ -1038,9 +1049,11 @@ impl AnimezClient {
                 },
             );
 
+        if let Some(aid) = anime_id {
+            form = form.text("anime_id", aid.to_string());
+        }
         if let Some(m) = mal {
             form = form.text("mal_id", m.mal_id.to_string());
-            form = form.text("anime_id", m.mal_id.to_string());
         }
         if let Some(res) = &parsed.resolution {
             form = form.text("resolution", res.clone());
@@ -1162,6 +1175,13 @@ impl AnimezClient {
             anyhow::bail!("Tracker upload failed with HTTP {status}: {body}");
         }
 
+        if final_url.ends_with("/upload")
+            || (final_url.contains("/upload") && !final_url.contains("/torrents/"))
+        {
+            let err_msg = Self::extract_form_errors(&body);
+            anyhow::bail!("AnimeZ rejected upload form and returned to '{final_url}': {err_msg}");
+        }
+
         let mut torrent_id_str = None;
         let is_draft = final_url.ends_with("/edit")
             || (final_url.contains("/torrents/") && final_url.contains("/edit"));
@@ -1217,17 +1237,21 @@ impl AnimezClient {
             }
 
             // Resolve AnimeZ internal anime entry (ID and canonical title)
-            let (anime_id, anime_title) = match self
-                .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
-                .await?
-            {
-                Some(entry) => entry,
-                None => {
-                    anyhow::bail!(
-                        "Could not resolve AnimeZ anime ID for '{}' (mal_id: {:?}); draft {tid} not published",
-                        parsed.clean_title,
-                        mal.map(|m| m.mal_id)
-                    );
+            let (pub_anime_id, pub_anime_title) = if let (Some(aid), Some(atitle)) = (anime_id, animez_title) {
+                (aid, atitle.to_string())
+            } else {
+                match self
+                    .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+                    .await?
+                {
+                    Some(entry) => entry,
+                    None => {
+                        anyhow::bail!(
+                            "Could not resolve AnimeZ anime ID for '{}' (mal_id: {:?}); draft {tid} not published",
+                            parsed.clean_title,
+                            mal.map(|m| m.mal_id)
+                        );
+                    }
                 }
             };
 
@@ -1239,8 +1263,8 @@ impl AnimezClient {
                     mal,
                     bundle,
                     &edit_csrf_token,
-                    anime_id,
-                    Some(&anime_title),
+                    pub_anime_id,
+                    Some(&pub_anime_title),
                     &final_url,
                 )
                 .await?;
@@ -1250,11 +1274,8 @@ impl AnimezClient {
             torrent_id_str = Some(tid.to_string());
         }
 
-        let download_link = if let Some(ref tid) = torrent_id_str {
-            Some(format!("{base}/torrents/{tid}/download"))
-        } else {
-            Self::extract_download_torrent_url(base, &final_url, &body)
-        };
+        let download_link = Self::extract_download_torrent_url(base, &final_url, &body)
+            .or_else(|| torrent_id_str.as_ref().map(|tid| format!("{base}/torrents/{tid}/download")));
 
         let downloaded_tracker_torrent_path = if let Some(dl_url) = &download_link {
             let dest_path = bundle.torrent_path.with_extension("animez.torrent");

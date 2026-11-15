@@ -364,6 +364,30 @@ impl QbittorrentClient {
         );
         Ok(())
     }
+
+    /// Deletes a torrent from qBittorrent without deleting the downloaded media files on disk.
+    pub async fn delete_torrent(&self, info_hash: &str) -> Result<()> {
+        let url = format!("{}/api/v2/torrents/delete", self.base_url());
+        let resp = self
+            .qbit_post(&url)?
+            .form(&[
+                ("hashes", info_hash.trim().to_ascii_lowercase()),
+                ("deleteFiles", "false".to_string()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("Failed to delete torrent {info_hash} from qBittorrent"))?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("qBittorrent delete torrent returned HTTP {}", resp.status());
+        }
+
+        info!(
+            hash = %info_hash,
+            "Deleted original source torrent from qBittorrent (kept downloaded media files on disk)"
+        );
+        Ok(())
+    }
 }
 
 /// Extracts a 40-char hex infohash from a `magnet:?xt=urn:btih:...` URI.
