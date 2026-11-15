@@ -886,6 +886,48 @@ pub async fn resolve_external_links_from_url(
     Ok(links)
 }
 
+/// Queries Nyaa.si search to locate a release's canonical view page URL (`https://nyaa.si/view/<id>`)
+/// by raw title or clean anime title.
+pub async fn find_nyaa_view_url(http: &Client, query: &str) -> Option<String> {
+    let clean = query.trim();
+    if clean.is_empty() {
+        return None;
+    }
+
+    let mut url = match url::Url::parse("https://nyaa.si/") {
+        Ok(u) => u,
+        Err(_) => return None,
+    };
+    url.query_pairs_mut()
+        .append_pair("f", "0")
+        .append_pair("c", "0_0")
+        .append_pair("q", clean);
+
+    let resp = http
+        .get(url.as_str())
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let text = resp.text().await.ok()?;
+    static VIEW_RE: OnceLock<Regex> = OnceLock::new();
+    let re = VIEW_RE.get_or_init(|| Regex::new(r#"/view/(\d+)"#).unwrap());
+    if let Some(caps) = re.captures(&text) {
+        let id = &caps[1];
+        return Some(format!("https://nyaa.si/view/{id}"));
+    }
+    None
+}
+
 /// Formats a torrent release title strictly according to AnimeZ official naming standards:
 /// https://animez.to/guides/how-to-properly-titlename-a-torrent
 ///

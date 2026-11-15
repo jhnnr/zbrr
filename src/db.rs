@@ -202,6 +202,16 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_mal_id(&self, id: i64, mal_id: u64) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE releases SET mal_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![mal_id as i64, now, id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_skipped(&self, id: i64, reason: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
@@ -949,6 +959,11 @@ mod tests {
         assert_eq!(rec.state, ReleaseState::DupeChecked);
         assert_eq!(rec.mal_id, Some(52991));
         assert_eq!(rec.info_url.as_deref(), Some("https://nyaa.si/view/123456"));
+
+        db.update_mal_id(id, 63801)?;
+        let rec = db.get_release_by_id(id)?.unwrap();
+        assert_eq!(rec.state, ReleaseState::DupeChecked);
+        assert_eq!(rec.mal_id, Some(63801));
 
         db.mark_failed(id, "network timeout")?;
         let rec = db.get_release_by_id(id)?.unwrap();

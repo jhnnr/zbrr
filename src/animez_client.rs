@@ -1406,6 +1406,49 @@ impl AnimezClient {
             }
         }
 
+        // Fallback: If anime entry is still unresolved, search Nyaa for canonical MAL/AniDB links
+        if final_anime_id.is_none() {
+            let mut search_candidates = Vec::new();
+            if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await {
+                search_candidates.push(nyaa_view);
+            }
+            if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await {
+                if !search_candidates.contains(&nyaa_view) {
+                    search_candidates.push(nyaa_view);
+                }
+            }
+            for candidate in search_candidates {
+                if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, &candidate).await {
+                    if let Some(ref m_url) = links.mal_url {
+                        if let Ok(Some((aid, title))) = self.import_or_resolve_anime(m_url, &csrf_token, &upload_url).await {
+                            info!(
+                                anime_id = aid,
+                                title = %title,
+                                url = %m_url,
+                                "Resolved AnimeZ anime entry via discovered MAL link from Nyaa"
+                            );
+                            final_anime_id = Some(aid);
+                            final_anime_title = Some(title);
+                            break;
+                        }
+                    }
+                    if let Some(ref a_url) = links.anidb_url {
+                        if let Ok(Some((aid, title))) = self.import_or_resolve_anime(a_url, &csrf_token, &upload_url).await {
+                            info!(
+                                anime_id = aid,
+                                title = %title,
+                                url = %a_url,
+                                "Resolved AnimeZ anime entry via discovered AniDB link from Nyaa"
+                            );
+                            final_anime_id = Some(aid);
+                            final_anime_title = Some(title);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let torrent_name = crate::parser::format_animez_torrent_title(
             parsed,
             mal,
@@ -1658,6 +1701,33 @@ impl AnimezClient {
                     resolved = self
                         .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
                         .await?;
+                }
+                if resolved.is_none() {
+                    let mut search_candidates = Vec::new();
+                    if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await {
+                        search_candidates.push(nyaa_view);
+                    }
+                    if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await {
+                        if !search_candidates.contains(&nyaa_view) {
+                            search_candidates.push(nyaa_view);
+                        }
+                    }
+                    for candidate in search_candidates {
+                        if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, &candidate).await {
+                            if let Some(ref m_url) = links.mal_url {
+                                if let Ok(Some(entry)) = self.import_or_resolve_anime(m_url, &edit_csrf_token, &final_url).await {
+                                    resolved = Some(entry);
+                                    break;
+                                }
+                            }
+                            if let Some(ref a_url) = links.anidb_url {
+                                if let Ok(Some(entry)) = self.import_or_resolve_anime(a_url, &edit_csrf_token, &final_url).await {
+                                    resolved = Some(entry);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 match resolved {
                     Some(entry) => entry,

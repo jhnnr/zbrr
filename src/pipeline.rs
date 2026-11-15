@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::dupe_checker::DupeChecker;
 use crate::flaresolverr::FlareSolverrClient;
-use crate::models::{DiscoveredRelease, PackageBundle, ParsedRelease, ReleaseRecord, ReleaseState};
+use crate::models::{DiscoveredRelease, MalMetadata, PackageBundle, ParsedRelease, ReleaseRecord, ReleaseState};
 use crate::packager::Packager;
 use crate::parser::{parse_anime_release, JikanResolver};
 use crate::prowlarr::ProwlarrClient;
@@ -666,48 +666,8 @@ impl Pipeline {
                 return Ok(());
             }
 
-            let mut mal_meta = None;
-            let mut mal_id = record.mal_id;
-
-            // 1. Attempt to resolve canonical MAL link from the release info_url (Nyaa page / fansub info)
-            let target_info_url = record
-                .info_url
-                .as_deref()
-                .or_else(|| {
-                    if record.guid.starts_with("http") {
-                        Some(record.guid.as_str())
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(url) = target_info_url {
-                if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, url).await {
-                    if let Some(mid) = links.mal_id {
-                        info!(
-                            id = id,
-                            mal_id = mid,
-                            url = url,
-                            "Extracted canonical MAL ID directly from release info page"
-                        );
-                        mal_id = Some(mid);
-                        mal_meta = self.jikan.resolve_mal_by_id(mid).await.ok().flatten();
-                    }
-                }
-            }
-
-            // 2. Fall back to title-based Jikan search if MAL was not found from the info page
-            if mal_meta.is_none() {
-                if let Some(mid) = mal_id {
-                    mal_meta = self.jikan.resolve_mal_by_id(mid).await.ok().flatten();
-                }
-            }
-            if mal_meta.is_none() {
-                mal_meta = self.jikan.resolve_mal(&parsed.clean_title).await?;
-                if mal_id.is_none() {
-                    mal_id = mal_meta.as_ref().map(|m| m.mal_id);
-                }
-            }
+            let _mal_meta = self.resolve_mal_for_release(&mut record, &parsed).await?;
+            let mal_id = record.mal_id;
 
             // 2. Check Ongoing Season Catch-Up Rule (AnimeZ Upload Rules Section 3)
             if let Some(catchup_reason) = self
@@ -987,15 +947,7 @@ impl Pipeline {
                 None => self.reconstruct_bundle_from_record(&record)?,
             };
 
-            let mal_meta = if let Some(mid) = record.mal_id {
-                self.jikan.resolve_mal_by_id(mid).await.ok().flatten()
-            } else {
-                None
-            };
-            let mal_meta = match mal_meta {
-                Some(m) => Some(m),
-                None => self.jikan.resolve_mal(&parsed.clean_title).await?,
-            };
+            let mal_meta = self.resolve_mal_for_release(&mut record, &parsed).await?;
 
             // Pre-upload duplicate check right before sending the upload POST
             if !dry_run {
@@ -1338,6 +1290,138 @@ impl Pipeline {
         }
 
         Ok(queued_ids)
+    }
+
+    async fn resolve_mal_for_release(
+        &self,
+        record: &mut ReleaseRecord,
+        parsed: &ParsedRelease,
+    ) -> Result<Option<MalMetadata>> {
+        // 1. If record already has a mal_id, try fetching its metadata via Jikan
+        if let Some(mid) = record.mal_id {
+            if let Ok(Some(meta)) = self.jikan.resolve_mal_by_id(mid).await {
+                return Ok(Some(meta));
+            }
+            return Ok(Some(MalMetadata {
+                mal_id: mid,
+                title: parsed.clean_title.clone(),
+                title_english: None,
+                title_japanese: None,
+                media_type: None,
+                episodes: None,
+                year: parsed.year,
+                synopsis: None,
+                image_url: None,
+            }));
+        }
+
+        // 2. Build target URLs from info_url, guid (if http), and rewritten nyaa download URLs
+        let mut target_urls = Vec::new();
+        if let Some(ref u) = record.info_url {
+            target_urls.push(u.clone());
+        }
+        if record.guid.starts_with("http") && !target_urls.contains(&record.guid) {
+            target_urls.push(record.guid.clone());
+        }
+        if let Some(dl) = &record.download_url {
+            if dl.contains("nyaa.si/download/") {
+                static NYAA_DL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                let re = NYAA_DL_RE.get_or_init(|| regex::Regex::new(r#"nyaa\.si/download/(\d+)"#).unwrap());
+                if let Some(caps) = re.captures(dl) {
+                    let view_url = format!("https://nyaa.si/view/{}", &caps[1]);
+                    if !target_urls.contains(&view_url) {
+                        target_urls.push(view_url);
+                    }
+                }
+            }
+        }
+
+        for url in &target_urls {
+            if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, url).await {
+                if let Some(mid) = links.mal_id {
+                    info!(
+                        id = record.id,
+                        mal_id = mid,
+                        url = %url,
+                        "Extracted canonical MAL ID directly from release info page"
+                    );
+                    record.mal_id = Some(mid);
+                    let db_upd = self.db.clone();
+                    let id = record.id;
+                    let _ = tokio::task::spawn_blocking(move || db_upd.update_mal_id(id, mid)).await;
+
+                    if let Ok(Some(meta)) = self.jikan.resolve_mal_by_id(mid).await {
+                        return Ok(Some(meta));
+                    }
+                    return Ok(Some(MalMetadata {
+                        mal_id: mid,
+                        title: parsed.clean_title.clone(),
+                        title_english: None,
+                        title_japanese: None,
+                        media_type: None,
+                        episodes: None,
+                        year: parsed.year,
+                        synopsis: None,
+                        image_url: None,
+                    }));
+                }
+            }
+        }
+
+        // 3. If not found yet, query Nyaa search directly by raw_title and clean_title
+        let mut search_candidates = Vec::new();
+        if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &record.raw_title).await {
+            search_candidates.push(nyaa_view);
+        }
+        if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await {
+            if !search_candidates.contains(&nyaa_view) {
+                search_candidates.push(nyaa_view);
+            }
+        }
+
+        for url in &search_candidates {
+            if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, url).await {
+                if let Some(mid) = links.mal_id {
+                    info!(
+                        id = record.id,
+                        mal_id = mid,
+                        url = %url,
+                        "Extracted canonical MAL ID via Nyaa search and release info page"
+                    );
+                    record.mal_id = Some(mid);
+                    let db_upd = self.db.clone();
+                    let id = record.id;
+                    let _ = tokio::task::spawn_blocking(move || db_upd.update_mal_id(id, mid)).await;
+
+                    if let Ok(Some(meta)) = self.jikan.resolve_mal_by_id(mid).await {
+                        return Ok(Some(meta));
+                    }
+                    return Ok(Some(MalMetadata {
+                        mal_id: mid,
+                        title: parsed.clean_title.clone(),
+                        title_english: None,
+                        title_japanese: None,
+                        media_type: None,
+                        episodes: None,
+                        year: parsed.year,
+                        synopsis: None,
+                        image_url: None,
+                    }));
+                }
+            }
+        }
+
+        // 4. Fall back to title-based Jikan search
+        if let Ok(Some(meta)) = self.jikan.resolve_mal(&parsed.clean_title).await {
+            let mid = meta.mal_id;
+            record.mal_id = Some(mid);
+            let db_upd = self.db.clone();
+            let id = record.id;
+            let _ = tokio::task::spawn_blocking(move || db_upd.update_mal_id(id, mid)).await;
+            return Ok(Some(meta));
+        }
+
+        Ok(None)
     }
 
     fn reconstruct_bundle_from_record(&self, record: &ReleaseRecord) -> Result<PackageBundle> {
