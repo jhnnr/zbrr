@@ -298,8 +298,8 @@ impl Pipeline {
                     let starter_id = starter_rec.id;
                     let starter_title = starter_rec.raw_title.clone();
                     let starter_parsed = starter_rec.parsed().ok();
-                    let is_starter = starter_parsed.as_ref().map_or(false, |p| {
-                        p.episode.map_or(false, |ep| ep <= 1) || p.is_season_pack
+                    let is_starter = starter_parsed.as_ref().is_some_and(|p| {
+                        p.episode.is_some_and(|ep| ep <= 1) || p.is_season_pack
                     });
 
                     if is_starter {
@@ -485,6 +485,57 @@ impl Pipeline {
                     .check_remote_duplicate(&parsed, record.mal_id)
                     .await?;
                 if recheck.is_dupe {
+                    // Check if this release was already uploaded to AnimeZ (e.g. prior attempt succeeded uploading, but failed tracker download/injection)
+                    let mut reseed_rescued = false;
+                    if let Some(matched_url) = recheck.matched_torrent_url.as_deref() {
+                        if let Some(tid) = AnimezClient::extract_torrent_id_from_url(matched_url) {
+                            let base = self.config.animez.base_url.trim_end_matches('/');
+                            let dl_url = format!("{base}/torrents/{tid}/download");
+                            let dest_path = bundle.torrent_path.with_extension("animez.torrent");
+                            info!(
+                                id = id,
+                                torrent_id = tid,
+                                download_url = %dl_url,
+                                "Pre-upload dupe check found existing release on AnimeZ; attempting auto-reseed rescue"
+                            );
+                            if let Ok(()) = self.animez.download_tracker_torrent(&dl_url, &dest_path).await {
+                                if let Some(save_path) = record.save_path.as_deref() {
+                                    if let Ok(()) = self.qbit.inject_seeding_torrent(&dest_path, save_path).await {
+                                        // Delete staging torrent if different
+                                        if let Some(source_hash) = record.source_info_hash.as_deref() {
+                                            let is_different = std::fs::read(&dest_path).ok().and_then(|b| {
+                                                crate::qbittorrent::compute_infohash_from_torrent_bytes(&b)
+                                            }).is_none_or(|h| !h.eq_ignore_ascii_case(source_hash));
+                                            if is_different {
+                                                let _ = self.qbit.delete_torrent(source_hash).await;
+                                            }
+                                        }
+
+                                        let db_seed = self.db.clone();
+                                        let page_url = matched_url.to_string();
+                                        let _ = tokio::task::spawn_blocking(move || db_seed.set_seeding(id, Some(&page_url))).await;
+
+                                        let db_unskip = self.db.clone();
+                                        let clean_title = parsed.clean_title.clone();
+                                        let _ = tokio::task::spawn_blocking(move || db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id)).await;
+
+                                        info!(
+                                            id = id,
+                                            title = %record.raw_title,
+                                            page_url = %matched_url,
+                                            "Successfully rescued and seeded release discovered during pre-upload dupe check!"
+                                        );
+                                        reseed_rescued = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if reseed_rescued {
+                        return Ok(());
+                    }
+
                     info!(
                         id = id,
                         title = %record.raw_title,
@@ -540,7 +591,12 @@ impl Pipeline {
                     let is_different = upload_res
                         .downloaded_tracker_torrent_path
                         .as_ref()
-                        .map(|_| true)
+                        .map(|p| {
+                            std::fs::read(p)
+                                .ok()
+                                .and_then(|b| crate::qbittorrent::compute_infohash_from_torrent_bytes(&b))
+                                .is_none_or(|h| !h.eq_ignore_ascii_case(source_hash))
+                        })
                         .unwrap_or(true);
 
                     if is_different {

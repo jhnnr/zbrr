@@ -305,12 +305,11 @@ pub fn load_env_file_safe(path: &Path) {
                 if let Some((k, v)) = trimmed.split_once('=') {
                     let key = k.trim();
                     let mut val = v.trim();
-                    if (val.starts_with('\'') && val.ends_with('\''))
-                        || (val.starts_with('"') && val.ends_with('"'))
+                    if ((val.starts_with('\'') && val.ends_with('\''))
+                        || (val.starts_with('"') && val.ends_with('"')))
+                        && val.len() >= 2
                     {
-                        if val.len() >= 2 {
-                            val = &val[1..val.len() - 1];
-                        }
+                        val = &val[1..val.len() - 1];
                     }
                     if !key.is_empty() {
                         env::set_var(key, val);
@@ -374,7 +373,7 @@ impl AppConfig {
             if let Some(parent) = target_db.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            if let Ok(_) = fs::copy(&legacy_db, &target_db) {
+            if fs::copy(&legacy_db, &target_db).is_ok() {
                 tracing::info!(
                     from = %legacy_db.display(),
                     to = %target_db.display(),
@@ -389,7 +388,7 @@ impl AppConfig {
             if let Some(parent) = target_cookies.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            if let Ok(_) = fs::copy(&legacy_cookies, target_cookies) {
+            if fs::copy(&legacy_cookies, target_cookies).is_ok() {
                 tracing::info!(
                     from = %legacy_cookies.display(),
                     to = %target_cookies.display(),

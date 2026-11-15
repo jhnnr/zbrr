@@ -5,7 +5,8 @@ use crate::models::{
     ParsedRelease, SelectOptionSchema, UploadResult,
 };
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, COOKIE, REFERER, USER_AGENT};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
@@ -13,6 +14,7 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -44,6 +46,8 @@ struct AnimeSearchItem {
     title_native: Option<String>,
     #[serde(default)]
     year: Option<i32>,
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     external_ids: Option<AnimeSearchExternalIds>,
 }
@@ -718,11 +722,205 @@ impl AnimezClient {
         Ok(Self::parse_torrent_search_html(base, &html))
     }
 
-    /// Resolves AnimeZ's internal anime entry (`(id, title)`) for a release using `https://animez.to/search?type=anime&q=...`.
+    fn extract_year_from_title(title: &str) -> Option<u32> {
+        static Y_RE: OnceLock<Regex> = OnceLock::new();
+        let y_re = Y_RE.get_or_init(|| Regex::new(r"\((?:19|20)\d{2}\)").unwrap());
+        static DIGITS_RE: OnceLock<Regex> = OnceLock::new();
+        let digits_re = DIGITS_RE.get_or_init(|| Regex::new(r"\d{4}").unwrap());
+        y_re.find(title)
+            .and_then(|m| digits_re.find(m.as_str()))
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+    }
+
+    fn extract_item_season(item: &AnimeSearchItem) -> Option<u32> {
+        static S_RE: OnceLock<Regex> = OnceLock::new();
+        let s_re = S_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(?:(\d{1,2})(?:st|nd|rd|th)\s*Season|(?:First|Second|Third|Fourth|Fifth|Sixth)\s*Season|Season\s*(\d{1,2})|\bII\b|\bIII\b|\bIV\b|\bVI\b)\b").unwrap()
+        });
+
+        for name in [&item.title, item.title_romaji.as_deref().unwrap_or("")] {
+            if let Some(caps) = s_re.captures(name) {
+                if let Some(n) = caps.get(1) {
+                    return n.as_str().parse::<u32>().ok();
+                } else if let Some(n) = caps.get(2) {
+                    return n.as_str().parse::<u32>().ok();
+                } else {
+                    let lower = name.to_ascii_lowercase();
+                    if lower.contains("second") || lower.contains("2nd") || lower.contains(" ii") {
+                        return Some(2);
+                    } else if lower.contains("third") || lower.contains("3rd") || lower.contains(" iii") {
+                        return Some(3);
+                    } else if lower.contains("fourth") || lower.contains("4th") || lower.contains(" iv") {
+                        return Some(4);
+                    } else if lower.contains("fifth") || lower.contains("5th") {
+                        return Some(5);
+                    } else if lower.contains("sixth") || lower.contains("6th") || lower.contains(" vi") {
+                        return Some(6);
+                    } else if lower.contains("first") || lower.contains("1st") {
+                        return Some(1);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn score_anime_candidate(
+        item: &AnimeSearchItem,
+        target_title: &str,
+        target_year: Option<u32>,
+        target_season: Option<u32>,
+        target_mal_id: Option<u64>,
+    ) -> i32 {
+        // 1. Direct MAL ID match (+1000)
+        if let Some(target_mal) = target_mal_id {
+            if let Some(ext) = &item.external_ids {
+                if let Some(mal_val) = &ext.mal {
+                    let mal_str = match mal_val {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => s.trim().to_string(),
+                        _ => String::new(),
+                    };
+                    if mal_str == target_mal.to_string() {
+                        return 1000;
+                    }
+                }
+            }
+        }
+
+        let norm_target = Self::normalize_title_for_lookup(target_title);
+        static SEASON_STRIP_RE: OnceLock<Regex> = OnceLock::new();
+        let season_strip_re = SEASON_STRIP_RE.get_or_init(|| {
+            Regex::new(r"(?i)\b(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|season)\s*(?:season|\d{1,2})?\b").unwrap()
+        });
+        let norm_target_base = season_strip_re
+            .replace_all(&norm_target, " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let titles_to_check = [
+            Some(&item.title),
+            item.title_romaji.as_ref(),
+            item.title_native.as_ref(),
+        ];
+
+        let mut title_matched = false;
+        let mut score = 0;
+
+        static YEAR_STRIP_RE: OnceLock<Regex> = OnceLock::new();
+        let year_strip_re = YEAR_STRIP_RE.get_or_init(|| {
+            Regex::new(r"\b(?:19|20)\d{2}\b").unwrap()
+        });
+
+        for t_opt in titles_to_check.into_iter().flatten() {
+            let norm_t = Self::normalize_title_for_lookup(t_opt);
+            let norm_t_no_year = year_strip_re
+                .replace_all(&norm_t, " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if norm_t == norm_target
+                || (!norm_target_base.is_empty() && norm_t == norm_target_base)
+                || norm_t_no_year == norm_target
+                || (!norm_target_base.is_empty() && norm_t_no_year == norm_target_base)
+            {
+                score += 100;
+                title_matched = true;
+                break;
+            } else if (!norm_target_base.is_empty() && norm_target_base.len() >= 4 && norm_t.contains(&norm_target_base))
+                || (norm_t.len() >= 4 && !norm_target_base.is_empty() && norm_target_base.contains(&norm_t))
+                || (norm_target.len() >= 4 && norm_t.contains(&norm_target))
+                || (!norm_target_base.is_empty() && norm_target_base.len() >= 4 && norm_t_no_year.contains(&norm_target_base))
+            {
+                score += 60;
+                title_matched = true;
+                break;
+            }
+        }
+
+        if !title_matched {
+            return -999;
+        }
+
+        let target_s = target_season.unwrap_or(1);
+        let item_s = Self::extract_item_season(item);
+        let item_title_year = titles_to_check
+            .into_iter()
+            .flatten()
+            .find_map(|t| Self::extract_year_from_title(t));
+
+        if target_s > 1 {
+            if let Some(is) = item_s {
+                if is == target_s {
+                    score += 150;
+                } else {
+                    score -= 150;
+                }
+            } else if item_title_year.is_some() {
+                // Item has a year in title (e.g. "Yasei no Last Boss ga Arawareta! (2026)")
+                // In AniDB/AnimeZ conventions, titles with (YYYY) represent sequels when the base title has no season suffix.
+                score += 150;
+            } else {
+                // Item has NO season suffix and NO year in title: it is Season 1!
+                score -= 150;
+            }
+
+            if let Some(st) = &item.status {
+                if st.eq_ignore_ascii_case("releasing") {
+                    score += 50;
+                } else if st.eq_ignore_ascii_case("finished") {
+                    score -= 40;
+                }
+            }
+
+            let current_year = Utc::now().year();
+            if let Some(y) = item.year {
+                if y >= current_year - 1 {
+                    score += 40;
+                } else {
+                    score -= 50;
+                }
+            }
+        } else {
+            // Target is Season 1
+            if let Some(is) = item_s {
+                if is > 1 {
+                    score -= 150;
+                } else {
+                    score += 50;
+                }
+            } else if let Some(ity) = item_title_year {
+                // Item has a year in title (e.g. (2026)), but target is Season 1
+                if target_year == Some(ity) {
+                    score += 100;
+                } else {
+                    score -= 150;
+                }
+            } else {
+                // Clean base title with no season and no year is standard Season 1
+                score += 100;
+            }
+        }
+
+        if let (Some(y1), Some(y2)) = (target_year, item.year) {
+            if (y1 as i32) == y2 {
+                score += 50;
+            } else {
+                score -= 20;
+            }
+        }
+
+        score
+    }
+
+    /// Resolves AnimeZ's internal anime entry (`(id, canonical_title)`) for a release using `https://animez.to/search?type=anime&q=...`.
     pub async fn lookup_anime_entry(
         &self,
         title: &str,
         year: Option<u32>,
+        season: Option<u32>,
         mal_id: Option<u64>,
     ) -> Result<Option<(u64, String)>> {
         let base = self.config.animez.base_url.trim_end_matches('/');
@@ -743,88 +941,86 @@ impl AnimezClient {
             return Ok(None);
         }
 
-        let search_res: AnimeSearchResponse = resp.json().await.unwrap_or(AnimeSearchResponse {
+        let mut search_res: AnimeSearchResponse = resp.json().await.unwrap_or(AnimeSearchResponse {
             animes: Vec::new(),
             torrents: Vec::new(),
         });
 
+        // If search returned empty and title contains season terms, try searching base title
         if search_res.animes.is_empty() {
-            debug!(title = title, "No anime entries returned in AnimeZ search");
-            return Ok(None);
-        }
-
-        // 1. Try match by MAL ID if available
-        if let Some(target_mal) = mal_id {
-            let target_str = target_mal.to_string();
-            for item in &search_res.animes {
-                if let Some(ext) = &item.external_ids {
-                    if let Some(mal_val) = &ext.mal {
-                        let mal_str = match mal_val {
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::String(s) => s.trim().to_string(),
-                            _ => String::new(),
-                        };
-                        if mal_str == target_str {
-                            info!(
-                                anime_id = item.id,
-                                anime_title = %item.title,
-                                mal_id = target_mal,
-                                "Resolved AnimeZ anime entry via MAL ID match"
-                            );
-                            return Ok(Some((item.id, item.title.clone())));
+            let stripped_query = title
+                .split_whitespace()
+                .take_while(|w| !w.eq_ignore_ascii_case("season") && !w.ends_with("nd") && !w.ends_with("rd") && !w.ends_with("th"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !stripped_query.is_empty() && stripped_query != title.trim() {
+                let mut fallback_url = url::Url::parse(&format!("{base}/search"))?;
+                fallback_url.query_pairs_mut()
+                    .append_pair("type", "anime")
+                    .append_pair("q", stripped_query.trim());
+                if let Ok(f_resp) = self.http.get(fallback_url.as_str()).headers(self.build_ajax_headers(Some(fallback_url.as_str())).await?).send().await {
+                    if f_resp.status().is_success() {
+                        if let Ok(f_data) = f_resp.json::<AnimeSearchResponse>().await {
+                            search_res = f_data;
                         }
                     }
                 }
             }
         }
 
-        // 2. Try match by normalized title and year
-        let norm_target = Self::normalize_title_for_lookup(title);
-        for item in &search_res.animes {
-            let norm_item = Self::normalize_title_for_lookup(&item.title);
-            let title_matches = norm_item == norm_target
-                || (norm_target.len() >= 4 && norm_item.contains(&norm_target))
-                || (norm_item.len() >= 4 && norm_target.contains(&norm_item));
-
-            if title_matches {
-                if let (Some(y1), Some(y2)) = (year, item.year) {
-                    if (y1 as i32) == y2 {
-                        info!(
-                            anime_id = item.id,
-                            anime_title = %item.title,
-                            year = y1,
-                            "Resolved AnimeZ anime entry via title and year match"
-                        );
-                        return Ok(Some((item.id, item.title.clone())));
-                    }
-                }
-            }
+        if search_res.animes.is_empty() {
+            debug!(title = title, "No anime entries returned in AnimeZ search");
+            return Ok(None);
         }
 
-        // 3. Match by normalized title alone
-        for item in &search_res.animes {
-            let norm_item = Self::normalize_title_for_lookup(&item.title);
-            if norm_item == norm_target
-                || (norm_target.len() >= 5 && norm_item.contains(&norm_target))
-                || (norm_item.len() >= 5 && norm_target.contains(&norm_item))
-            {
+        let mut scored_candidates: Vec<(i32, &AnimeSearchItem)> = search_res
+            .animes
+            .iter()
+            .map(|item| {
+                let sc = Self::score_anime_candidate(item, title, year, season, mal_id);
+                (sc, item)
+            })
+            .collect();
+
+        scored_candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
+
+        if let Some((score, best)) = scored_candidates.first() {
+            if *score > 0 {
+                // AniDB main title is required by AnimeZ naming guidelines
+                let canonical_title = best
+                    .title_romaji
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&best.title);
+
                 info!(
-                    anime_id = item.id,
-                    anime_title = %item.title,
-                    "Resolved AnimeZ anime entry via normalized title match"
+                    anime_id = best.id,
+                    anime_title = %best.title,
+                    canonical_title = canonical_title,
+                    score = score,
+                    season = ?season,
+                    "Resolved best AnimeZ anime entry for release"
                 );
-                return Ok(Some((item.id, item.title.clone())));
+                return Ok(Some((best.id, canonical_title.to_string())));
             }
         }
 
-        // 4. Fallback to first candidate if available
-        if let Some(first) = search_res.animes.first() {
-            info!(
-                anime_id = first.id,
-                anime_title = %first.title,
-                "Resolved AnimeZ anime entry to first candidate in search results"
-            );
-            return Ok(Some((first.id, first.title.clone())));
+        // Fallback for Season 1 only if score >= 0
+        if season.unwrap_or(1) == 1 {
+            if let Some(first) = search_res.animes.first() {
+                let canonical_title = first
+                    .title_romaji
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&first.title);
+                info!(
+                    anime_id = first.id,
+                    anime_title = %first.title,
+                    canonical_title = canonical_title,
+                    "Resolved AnimeZ anime entry to first candidate as Season 1 fallback"
+                );
+                return Ok(Some((first.id, canonical_title.to_string())));
+            }
         }
 
         Ok(None)
@@ -835,9 +1031,10 @@ impl AnimezClient {
         &self,
         title: &str,
         year: Option<u32>,
+        season: Option<u32>,
         mal_id: Option<u64>,
     ) -> Result<Option<u64>> {
-        self.lookup_anime_entry(title, year, mal_id)
+        self.lookup_anime_entry(title, year, season, mal_id)
             .await
             .map(|opt| opt.map(|(id, _)| id))
     }
@@ -847,9 +1044,10 @@ impl AnimezClient {
         &self,
         title: &str,
         year: Option<u32>,
+        season: Option<u32>,
         mal_id: Option<u64>,
     ) -> Result<Option<String>> {
-        self.lookup_anime_entry(title, year, mal_id)
+        self.lookup_anime_entry(title, year, season, mal_id)
             .await
             .map(|opt| opt.map(|(_, t)| t))
     }
@@ -949,7 +1147,7 @@ impl AnimezClient {
         }
 
         let animez_entry = self
-            .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+            .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
             .await
             .ok()
             .flatten();
@@ -1169,7 +1367,7 @@ impl AnimezClient {
 
         let mut final_url = resp.url().to_string();
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let mut body = resp.text().await.unwrap_or_default();
 
         if !status.is_success() && !status.is_redirection() {
             anyhow::bail!("Tracker upload failed with HTTP {status}: {body}");
@@ -1186,16 +1384,7 @@ impl AnimezClient {
         let is_draft = final_url.ends_with("/edit")
             || (final_url.contains("/torrents/") && final_url.contains("/edit"));
 
-        let extracted_id = if let Some(pos) = final_url.find("/torrents/") {
-            let after = &final_url[pos + "/torrents/".len()..];
-            after
-                .split('/')
-                .next()
-                .and_then(|s| s.split('-').next())
-                .and_then(|id_str| id_str.parse::<u64>().ok())
-        } else {
-            None
-        };
+        let extracted_id = Self::extract_torrent_id_from_url(&final_url);
 
         if is_draft {
             let tid = match extracted_id {
@@ -1241,7 +1430,7 @@ impl AnimezClient {
                 (aid, atitle.to_string())
             } else {
                 match self
-                    .lookup_anime_entry(&parsed.clean_title, parsed.year, mal.map(|m| m.mal_id))
+                    .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
                     .await?
                 {
                     Some(entry) => entry,
@@ -1256,7 +1445,7 @@ impl AnimezClient {
             };
 
             // Publish draft
-            let published_url = self
+            let (published_url, published_body) = self
                 .publish_draft(
                     tid,
                     parsed,
@@ -1270,12 +1459,15 @@ impl AnimezClient {
                 .await?;
 
             final_url = published_url;
+            body = published_body;
         } else if let Some(tid) = extracted_id {
             torrent_id_str = Some(tid.to_string());
         }
 
-        let download_link = Self::extract_download_torrent_url(base, &final_url, &body)
-            .or_else(|| torrent_id_str.as_ref().map(|tid| format!("{base}/torrents/{tid}/download")));
+        let download_link = torrent_id_str
+            .as_ref()
+            .map(|tid| format!("{base}/torrents/{tid}/download"))
+            .or_else(|| Self::extract_download_torrent_url(base, &final_url, &body));
 
         let downloaded_tracker_torrent_path = if let Some(dl_url) = &download_link {
             let dest_path = bundle.torrent_path.with_extension("animez.torrent");
@@ -1405,7 +1597,22 @@ impl AnimezClient {
         Ok(count)
     }
 
+    /// Extracts the numeric torrent ID from a URL (e.g. `https://animez.to/torrents/36128` or `/torrents/36128-slug`).
+    pub fn extract_torrent_id_from_url(url: &str) -> Option<u64> {
+        if let Some(pos) = url.find("/torrents/") {
+            let after = &url[pos + "/torrents/".len()..];
+            after
+                .split('/')
+                .next()
+                .and_then(|s| s.split('-').next())
+                .and_then(|id_str| id_str.parse::<u64>().ok())
+        } else {
+            None
+        }
+    }
+
     /// Publishes a draft torrent on `animez.to` by submitting PATCH /torrents/{id} with is_draft = 0.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_draft(
         &self,
         torrent_id: u64,
@@ -1416,7 +1623,7 @@ impl AnimezClient {
         anime_id: u64,
         anime_title: Option<&str>,
         edit_page_url: &str,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         let base = self.config.animez.base_url.trim_end_matches('/');
         let publish_url = format!("{base}/torrents/{torrent_id}");
 
@@ -1518,10 +1725,11 @@ impl AnimezClient {
             "Successfully published draft release on animez.to!"
         );
 
-        Ok(final_url)
+        Ok((final_url, body))
     }
 
-    async fn download_tracker_torrent(&self, download_url: &str, dest: &Path) -> Result<()> {
+    /// Downloads the re-signed official `.torrent` from AnimeZ containing the user's tracker passkey/PID.
+    pub async fn download_tracker_torrent(&self, download_url: &str, dest: &Path) -> Result<()> {
         self.config.polite_sleep().await;
         let headers = self.build_headers(None).await?;
         let resp = self
@@ -1531,6 +1739,10 @@ impl AnimezClient {
             .send()
             .await
             .with_context(|| format!("Failed to GET tracker torrent at {download_url}"))?;
+
+        self.flaresolverr
+            .ingest_set_cookie_headers(resp.headers())
+            .await;
 
         if !resp.status().is_success() {
             anyhow::bail!("Tracker torrent download returned HTTP {}", resp.status());
@@ -1545,7 +1757,7 @@ impl AnimezClient {
         Ok(())
     }
 
-    fn extract_download_torrent_url(
+    pub fn extract_download_torrent_url(
         base_url: &str,
         page_url: &str,
         html: &str,
@@ -1569,7 +1781,8 @@ impl AnimezClient {
             }
         }
 
-        // If redirected to `/torrent/<id>` or `/torrents/<id>`, construct standard AvistaZ/UNIT3D download path
+        // If redirected to `/torrent/<id>` or `/torrents/<id>`, construct standard AvistaZ/AnimeZ download path:
+        // /torrents/{id}/download
         if page_url.contains("/torrent/") || page_url.contains("/torrents/") {
             if let Some(id_seg) = page_url
                 .trim_end_matches('/')
@@ -1579,7 +1792,7 @@ impl AnimezClient {
             {
                 if id_seg.chars().all(|c| c.is_ascii_digit()) {
                     return Some(format!(
-                        "{}/torrents/download/{id_seg}",
+                        "{}/torrents/{id_seg}/download",
                         base_url.trim_end_matches('/')
                     ));
                 }
@@ -1741,5 +1954,111 @@ mod tests {
         assert!(res.is_err());
         let err_str = res.unwrap_err().to_string();
         assert!(err_str.contains("strictly require a minimum of 6 screenshots"));
+    }
+
+    #[test]
+    fn test_extract_torrent_id_from_url() {
+        assert_eq!(
+            AnimezClient::extract_torrent_id_from_url("https://animez.to/torrents/36128"),
+            Some(36128)
+        );
+        assert_eq!(
+            AnimezClient::extract_torrent_id_from_url("https://animez.to/torrents/36128-slug-title"),
+            Some(36128)
+        );
+        assert_eq!(
+            AnimezClient::extract_torrent_id_from_url("https://animez.to/torrents/36128/edit"),
+            Some(36128)
+        );
+        assert_eq!(
+            AnimezClient::extract_torrent_id_from_url("https://animez.to/upload"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_download_torrent_url() {
+        let base = "https://animez.to";
+        let page_url = "https://animez.to/torrents/36128";
+        let html_with_btn = r#"
+            <div>
+                <a class="btn btn-lg btn-primary" href="https://animez.to/torrents/36128/download">Download</a>
+            </div>
+        "#;
+        assert_eq!(
+            AnimezClient::extract_download_torrent_url(base, page_url, html_with_btn).as_deref(),
+            Some("https://animez.to/torrents/36128/download")
+        );
+
+        // Fallback when HTML has no matching download button
+        assert_eq!(
+            AnimezClient::extract_download_torrent_url(base, page_url, "<html><body>No button</body></html>").as_deref(),
+            Some("https://animez.to/torrents/36128/download")
+        );
+    }
+
+    #[test]
+    fn test_score_anime_candidate_seasons() {
+        let s1 = AnimeSearchItem {
+            id: 10654,
+            title: "A Wild Last Boss Appeared!".to_string(),
+            title_romaji: Some("Yasei no Last Boss ga Arawareta!".to_string()),
+            title_native: None,
+            year: Some(2025),
+            status: Some("finished".to_string()),
+            external_ids: None,
+        };
+
+        let s2 = AnimeSearchItem {
+            id: 13495,
+            title: "A Wild Last Boss Appeared! (2026)".to_string(),
+            title_romaji: Some("Yasei no Last Boss ga Arawareta! (2026)".to_string()),
+            title_native: None,
+            year: Some(2026),
+            status: Some("releasing".to_string()),
+            external_ids: None,
+        };
+
+        // Looking for Season 2: S2 must beat S1 decisively
+        let score_s1_for_s2 = AnimezClient::score_anime_candidate(
+            &s1,
+            "Yasei no Last Boss ga Arawareta",
+            None,
+            Some(2),
+            None,
+        );
+        let score_s2_for_s2 = AnimezClient::score_anime_candidate(
+            &s2,
+            "Yasei no Last Boss ga Arawareta",
+            None,
+            Some(2),
+            None,
+        );
+        assert!(
+            score_s2_for_s2 > score_s1_for_s2,
+            "Season 2 item must outscore Season 1 item when target_season is 2 (got S2={score_s2_for_s2}, S1={score_s1_for_s2})"
+        );
+        assert!(score_s2_for_s2 > 0);
+
+        // Looking for Season 1: S1 must beat S2 decisively
+        let score_s1_for_s1 = AnimezClient::score_anime_candidate(
+            &s1,
+            "Yasei no Last Boss ga Arawareta",
+            None,
+            Some(1),
+            None,
+        );
+        let score_s2_for_s1 = AnimezClient::score_anime_candidate(
+            &s2,
+            "Yasei no Last Boss ga Arawareta",
+            None,
+            Some(1),
+            None,
+        );
+        assert!(
+            score_s1_for_s1 > score_s2_for_s1,
+            "Season 1 item must outscore Season 2 item when target_season is 1 (got S1={score_s1_for_s1}, S2={score_s2_for_s1})"
+        );
+        assert!(score_s1_for_s1 > 0);
     }
 }

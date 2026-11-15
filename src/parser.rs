@@ -188,12 +188,30 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         parsed.is_season_pack = true;
     }
 
-    static SEASON_PAREN_RE: OnceLock<Regex> = OnceLock::new();
-    let season_paren_re =
-        SEASON_PAREN_RE.get_or_init(|| Regex::new(r"(?i)\bSeason\s*(\d{1,2})\b").unwrap());
-    if let Some(caps) = season_paren_re.captures(&working) {
-        if let Ok(s) = caps[1].parse::<u32>() {
-            parsed.season = Some(s);
+    static SEASON_EXPLICIT_RE: OnceLock<Regex> = OnceLock::new();
+    let season_explicit_re = SEASON_EXPLICIT_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:(\d{1,2})(?:st|nd|rd|th)\s*Season|(?:First|Second|Third|Fourth|Fifth|Sixth)\s*Season|Season\s*(\d{1,2}))\b").unwrap()
+    });
+    if let Some(caps) = season_explicit_re.captures(&working) {
+        if let Some(num_str) = caps.get(1) {
+            parsed.season = num_str.as_str().parse::<u32>().ok();
+        } else if let Some(n) = caps.get(2) {
+            parsed.season = n.as_str().parse::<u32>().ok();
+        } else if let Some(word_match) = caps.get(0) {
+            let lower = word_match.as_str().to_ascii_lowercase();
+            if lower.contains("first") || lower.contains("1st") {
+                parsed.season = Some(1);
+            } else if lower.contains("second") || lower.contains("2nd") {
+                parsed.season = Some(2);
+            } else if lower.contains("third") || lower.contains("3rd") {
+                parsed.season = Some(3);
+            } else if lower.contains("fourth") || lower.contains("4th") {
+                parsed.season = Some(4);
+            } else if lower.contains("fifth") || lower.contains("5th") {
+                parsed.season = Some(5);
+            } else if lower.contains("sixth") || lower.contains("6th") {
+                parsed.season = Some(6);
+            }
         }
     }
 
@@ -211,10 +229,13 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
     let se_re =
         SE_RE.get_or_init(|| Regex::new(r"(?i)\bS(\d{1,2})E(\d{1,4})(?:v\d+)?\b").unwrap());
 
-    // Pattern B: S2 - 05 or Season 2 - 05
+    // Pattern B: S2 - 05 or Season 2 - 05 or 2nd Season - 05
     static S_DASH_E_RE: OnceLock<Regex> = OnceLock::new();
     let s_dash_e_re = S_DASH_E_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:S|Season\s*)(\d{1,2})\s*-\s*(\d{1,4})(?:v\d+)?\b").unwrap()
+        Regex::new(
+            r"(?i)\b(?:S(\d{1,2})|Season\s*(\d{1,2})|(?P<ord>\d{1,2})(?:st|nd|rd|th)\s*Season|(?P<word>First|Second|Third|Fourth|Fifth|Sixth)\s*Season)\s*-\s*(\d{1,4})(?:v\d+)?\b",
+        )
+        .unwrap()
     });
 
     // Pattern C: " - 01 " or " - 01v2" at end of title
@@ -235,8 +256,26 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         title_cut_idx = title_cut_idx.min(m.start());
     } else if let Some(m) = s_dash_e_re.find(&normalized_spaces) {
         let caps = s_dash_e_re.captures(&normalized_spaces).unwrap();
-        parsed.season = caps[1].parse::<u32>().ok();
-        parsed.episode = caps[2].parse::<u32>().ok();
+        if let Some(ord) = caps.name("ord") {
+            parsed.season = ord.as_str().parse::<u32>().ok();
+        } else if let Some(word) = caps.name("word") {
+            let lower = word.as_str().to_ascii_lowercase();
+            parsed.season = match lower.as_str() {
+                "first" => Some(1),
+                "second" => Some(2),
+                "third" => Some(3),
+                "fourth" => Some(4),
+                "fifth" => Some(5),
+                "sixth" => Some(6),
+                _ => None,
+            };
+        } else if let Some(s1) = caps.get(1) {
+            parsed.season = s1.as_str().parse::<u32>().ok();
+        } else if let Some(s2) = caps.get(2) {
+            parsed.season = s2.as_str().parse::<u32>().ok();
+        }
+        let ep_idx = caps.len() - 1;
+        parsed.episode = caps.get(ep_idx).and_then(|c| c.as_str().parse::<u32>().ok());
         title_cut_idx = title_cut_idx.min(m.start());
     } else if let Some(m) = dash_ep_re.find(&normalized_spaces) {
         let caps = dash_ep_re.captures(&normalized_spaces).unwrap();
@@ -510,7 +549,7 @@ pub fn format_animez_torrent_title(
     });
 
     if let Some(s) = parsed.season {
-        if s > 1 && !season_re.is_match(&title_part) {
+        if s > 1 && !season_re.is_match(&title_part) && !title_has_year {
             title_part = format!("{title_part} (Season {s:02})");
         }
     }
@@ -753,6 +792,29 @@ mod tests {
         assert_eq!(
             title,
             format!("Sister Breeder - 01-06 ({}) [030] [HEVC] [10-bit]", Utc::now().year())
+        );
+    }
+
+    #[test]
+    fn test_parse_yasei_no_last_boss_season_2() {
+        let p = parse_anime_release(
+            "[Erai-raws] Yasei no Last Boss ga Arawareta 2nd Season - 01 [1080p CR WEBRip HEVC AAC][MultiSub][2D919573].mkv",
+        );
+        assert_eq!(p.release_group.as_deref(), Some("Erai-raws"));
+        assert_eq!(p.clean_title, "Yasei no Last Boss ga Arawareta");
+        assert_eq!(p.season, Some(2));
+        assert_eq!(p.episode, Some(1));
+        assert_eq!(p.video_codec.as_deref(), Some("HEVC"));
+
+        // When AnimeZ canonical AniDB title is used
+        let title_with_animez = format_animez_torrent_title(
+            &p,
+            None,
+            Some("Yasei no Last Boss ga Arawareta! (2026)"),
+        );
+        assert_eq!(
+            title_with_animez,
+            "Yasei no Last Boss ga Arawareta! (2026) - 01 [Erai-raws] [HEVC]"
         );
     }
 

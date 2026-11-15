@@ -203,10 +203,11 @@ impl ProwlarrClient {
                     .map(|d| d.to_ascii_lowercase().contains(&q))
                     .unwrap_or(false);
 
-                if (matches_name || matches_def) && !is_excluded(idx.id, &idx.name) {
-                    if !target_ids.contains(&idx.id) {
-                        target_ids.push(idx.id);
-                    }
+                if (matches_name || matches_def)
+                    && !is_excluded(idx.id, &idx.name)
+                    && !target_ids.contains(&idx.id)
+                {
+                    target_ids.push(idx.id);
                 }
             }
         }
@@ -711,9 +712,7 @@ impl ProwlarrClient {
         }
 
         // AnimeZ rule compliance check (container, codecs, resolution, leaks)
-        if let Err(e) = crate::parser::check_animez_rule_compliance(parsed) {
-            return Err(e);
-        }
+        crate::parser::check_animez_rule_compliance(parsed)?;
 
         Ok(())
     }
