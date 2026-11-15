@@ -171,7 +171,9 @@ impl ProwlarrClient {
             }
             for excl in &self.config.prowlarr.exclude_indexers {
                 if name.eq_ignore_ascii_case(excl)
-                    || name.to_ascii_lowercase().contains(&excl.to_ascii_lowercase())
+                    || name
+                        .to_ascii_lowercase()
+                        .contains(&excl.to_ascii_lowercase())
                 {
                     return true;
                 }
@@ -313,7 +315,8 @@ impl ProwlarrClient {
 
         let target_indexer_ids = self.resolve_source_indexer_ids().await?;
 
-        let mut query_params: Vec<(String, String)> = vec![("type".to_string(), "search".to_string())];
+        let mut query_params: Vec<(String, String)> =
+            vec![("type".to_string(), "search".to_string())];
         if !self.config.prowlarr.query.trim().is_empty() {
             query_params.push(("query".to_string(), self.config.prowlarr.query.clone()));
         }
@@ -357,23 +360,21 @@ impl ProwlarrClient {
             let indexer_id = item.indexer_id.unwrap_or(0);
 
             // Verify not in excluded indexers
-            let is_excluded = self
-                .config
-                .prowlarr
-                .exclude_indexers
-                .iter()
-                .any(|excl| {
-                    indexer_name.eq_ignore_ascii_case(excl)
-                        || indexer_name
-                            .to_ascii_lowercase()
-                            .contains(&excl.to_ascii_lowercase())
-                });
+            let is_excluded = self.config.prowlarr.exclude_indexers.iter().any(|excl| {
+                indexer_name.eq_ignore_ascii_case(excl)
+                    || indexer_name
+                        .to_ascii_lowercase()
+                        .contains(&excl.to_ascii_lowercase())
+            });
             if is_excluded {
                 continue;
             }
 
             // Verify in target_indexer_ids if explicit targets were resolved
-            if !target_indexer_ids.is_empty() && indexer_id > 0 && !target_indexer_ids.contains(&indexer_id) {
+            if !target_indexer_ids.is_empty()
+                && indexer_id > 0
+                && !target_indexer_ids.contains(&indexer_id)
+            {
                 continue;
             }
 
@@ -405,7 +406,10 @@ impl ProwlarrClient {
             });
         }
 
-        info!(count = results.len(), "Fetched candidate items from Prowlarr REST API");
+        info!(
+            count = results.len(),
+            "Fetched candidate items from Prowlarr REST API"
+        );
         Ok(results)
     }
 
@@ -450,7 +454,11 @@ impl ProwlarrClient {
                 .with_context(|| format!("Failed to fetch Torznab RSS from {url}"))?;
 
             if !resp.status().is_success() {
-                anyhow::bail!("Torznab RSS returned HTTP {} for indexer {}", resp.status(), id);
+                anyhow::bail!(
+                    "Torznab RSS returned HTTP {} for indexer {}",
+                    resp.status(),
+                    id
+                );
             }
 
             let xml_text = resp.text().await?;
@@ -496,17 +504,13 @@ impl ProwlarrClient {
             .filter_map(|i| {
                 let title = i.title?;
                 let guid = i.guid.unwrap_or_else(|| title.clone());
-                let info_url = i
-                    .info_url
-                    .or(i.comment_url)
-                    .or(i.comments_url)
-                    .or_else(|| {
-                        if guid.starts_with("http") {
-                            Some(guid.clone())
-                        } else {
-                            None
-                        }
-                    });
+                let info_url = i.info_url.or(i.comment_url).or(i.comments_url).or_else(|| {
+                    if guid.starts_with("http") {
+                        Some(guid.clone())
+                    } else {
+                        None
+                    }
+                });
                 Some(DiscoveredRelease {
                     guid,
                     title,
@@ -594,17 +598,13 @@ impl ProwlarrClient {
             for i in items {
                 let Some(title) = i.title else { continue };
                 let guid = i.guid.unwrap_or_else(|| title.clone());
-                let info_url = i
-                    .info_url
-                    .or(i.comment_url)
-                    .or(i.comments_url)
-                    .or_else(|| {
-                        if guid.starts_with("http") {
-                            Some(guid.clone())
-                        } else {
-                            None
-                        }
-                    });
+                let info_url = i.info_url.or(i.comment_url).or(i.comments_url).or_else(|| {
+                    if guid.starts_with("http") {
+                        Some(guid.clone())
+                    } else {
+                        None
+                    }
+                });
                 if seen_guids.insert(guid.clone()) {
                     candidates.push(DiscoveredRelease {
                         guid,
@@ -662,17 +662,13 @@ impl ProwlarrClient {
         for i in items {
             let Some(title) = i.title else { continue };
             let guid = i.guid.unwrap_or_else(|| title.clone());
-            let info_url = i
-                .info_url
-                .or(i.comment_url)
-                .or(i.comments_url)
-                .or_else(|| {
-                    if guid.starts_with("http") {
-                        Some(guid.clone())
-                    } else {
-                        None
-                    }
-                });
+            let info_url = i.info_url.or(i.comment_url).or(i.comments_url).or_else(|| {
+                if guid.starts_with("http") {
+                    Some(guid.clone())
+                } else {
+                    None
+                }
+            });
             results.push(DiscoveredRelease {
                 guid,
                 title,
@@ -737,7 +733,10 @@ impl ProwlarrClient {
 
         // Include regexes (at least one must match if configured)
         if !self.include_regexes.is_empty()
-            && !self.include_regexes.iter().any(|re| re.is_match(&item.title))
+            && !self
+                .include_regexes
+                .iter()
+                .any(|re| re.is_match(&item.title))
         {
             return Err("Did not match any include_regex".to_string());
         }
@@ -867,7 +866,14 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                             }
                         }
                     } else if tag_name.ends_with("attr") {
-                        Self_parse_torznab_attr(&e, &mut seeders, &mut leechers, &mut info_hash, &mut magnet_url, &mut size_bytes);
+                        Self_parse_torznab_attr(
+                            &e,
+                            &mut seeders,
+                            &mut leechers,
+                            &mut info_hash,
+                            &mut magnet_url,
+                            &mut size_bytes,
+                        );
                     }
                 }
             }
@@ -884,7 +890,14 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                         }
                     }
                 } else if tag_name.ends_with("attr") {
-                    Self_parse_torznab_attr(&e, &mut seeders, &mut leechers, &mut info_hash, &mut magnet_url, &mut size_bytes);
+                    Self_parse_torznab_attr(
+                        &e,
+                        &mut seeders,
+                        &mut leechers,
+                        &mut info_hash,
+                        &mut magnet_url,
+                        &mut size_bytes,
+                    );
                 }
             }
             Ok(Event::Text(e)) if in_item => {

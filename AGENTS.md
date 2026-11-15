@@ -134,17 +134,30 @@ zbrr/
    - Anime uploads strictly require a minimum of 6 screenshots (maximum 9). The packager, pipeline, and uploader must validate that at least 6 screenshots exist and abort before uploading if fewer than 6 were generated.
    - Always probe true video track duration via MediaInfo and ffprobe stream duration (`stream_dur.min(format_dur)`) to avoid container duration overestimation past EOF.
    - Employ multi-stage seek fallbacks (fast input seek, accurate output seek, stepped earlier seeking) and an intermediate candidate pool so single timestamp misses never crash release packaging.
-9. **Ongoing Series Catch-Up Rule & Batching:**
-   - Per Section 3 of AnimeZ Upload Rules, standalone single episodes with `episode > 1` cannot be uploaded mid-season unless the user has established a prior sequence (having uploaded prior episodes in local DB or tracker profile) or uploads a catch-up batch of all episodes to date (`01~N`).
-   - When no prior sequence exists, `zbrr` automatically searches Prowlarr for missing prior episodes (`01` through `N-1`), downloads the complete set, and packages them into a batch upload titled `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
-10. **Anime Entry Auto-Import & Season Matching:**
+9. **Ongoing Series Catch-Up Rule & Batch Folder Assembly:**
+   - Per Section 3 of AnimeZ Upload Rules, starting an ongoing seasonal mid-season at episode `N > 1` requires the initial upload to be a single batch containing all episodes available to date (`01~N`) in one folder—standalone single episodes must not be uploaded mid-season.
+   - `zbrr` automatically downloads all aired prior episodes (`01` through `N-1`) matching group, resolution, source, and codec, places them into a single batch directory (`[Group] Title - 01~N...`), creates a multi-file `.torrent`, packages MediaInfo + 6 screenshots, and uploads as a batch `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
+   - Single episodes belonging to an incomplete catch-up batch are held in staging and are never uploaded individually.
+   - Once the catch-up batch is seeded, subsequent weekly episodes are uploaded individually as they air.
+
+10. **Season Finale Complete Batching:**
+    - When the last episode of a season/series is reached (detected via MAL metadata total episodes or `[END]`/`[FINAL]` title tags), `zbrr` combines all episodes (`01` through `Final`) into 1 folder, creates a complete season batch `.torrent`, and uploads it to AnimeZ.
+
+11. **Incomplete Started Series Priority & Discovery Gating:**
+    - If any series currently seeding in `animez-seeding` is missing Episode 01 or initial contiguous sequence, `zbrr` prioritizes searching Prowlarr for missing prior episodes and completing that started series.
+    - General discovery and advancement of brand-new anime series are deferred until started series are caught up.
+
+12. **Anime Entry Auto-Import & Season Matching:**
     - Never upload a Season 2 release under a Season 1 anime entry on `animez.to`. If the specific season entry is missing on AnimeZ, resolve the canonical MAL ID (scraped from Nyaa `Information` or via Jikan) and trigger AnimeZ's auto-import endpoint (`POST /anime`) with CSRF tokens before completing upload.
-11. **Staging Priority & Untracked Torrent Adoption:**
+
+13. **Staging Priority & Untracked Torrent Adoption:**
     - Prioritize completed torrents already resting in `animez-staging` before starting new Prowlarr downloads. If an untracked completed torrent exists in staging, adopt it into SQLite and proceed directly to packaging.
-12. **Multi-Source Canonical Metadata Scraper & Auto-Import Fallback:**
+
+14. **Multi-Source Canonical Metadata Scraper & Auto-Import Fallback:**
     - Always resolve canonical MAL/AniDB links from release information pages (e.g. Nyaa `Information` field linking to Erai-raws anime list pages) or via Nyaa search fallback (`find_nyaa_view_url`) before failing anime entry lookups.
     - Stage 5 must dynamically resolve canonical MAL metadata if `record.mal_id` is missing and persist it using SQLite `update_mal_id` (never use `set_dupe_checked` during `Uploading` or `Packaging` stages).
     - In `upload_release`, fallback to Nyaa search to auto-import via `POST /anime` before rejecting drafts.
-13. **qBittorrent Prowlarr Download URL Authentication & Active Registration:**
+
+15. **qBittorrent Prowlarr Download URL Authentication & Active Registration:**
     - When adding torrent download URLs that point to Prowlarr, always ensure the Prowlarr API key query parameter (`?apikey=...`) is appended so qBittorrent does not fail with HTTP 401 Unauthorized.
     - Poll qBittorrent immediately after adding a torrent to verify active registration in the transfer list before polling download progress, timing out early (30s) if qBittorrent rejected the torrent.

@@ -182,7 +182,10 @@ impl AnimezClient {
         self.config.polite_sleep().await;
 
         if !self.flaresolverr.has_session_cookies().await {
-            debug!(url = url, "No cached cookies present; initializing session via FlareSolverr");
+            debug!(
+                url = url,
+                "No cached cookies present; initializing session via FlareSolverr"
+            );
             let solved = self.flaresolverr.solve_get(url).await?;
             return Ok(solved.html);
         }
@@ -192,7 +195,9 @@ impl AnimezClient {
 
         match resp {
             Ok(r) => {
-                self.flaresolverr.ingest_set_cookie_headers(r.headers()).await;
+                self.flaresolverr
+                    .ingest_set_cookie_headers(r.headers())
+                    .await;
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
 
@@ -249,7 +254,10 @@ impl AnimezClient {
                 url = %login_url,
                 "Requesting login page via FlareSolverr to solve Cloudflare Turnstile"
             );
-            let solved = self.flaresolverr.solve_get_without_session(&login_url).await?;
+            let solved = self
+                .flaresolverr
+                .solve_get_without_session(&login_url)
+                .await?;
             csrf_opt = Self::extract_csrf_token(&solved.html);
             turnstile_opt = Self::extract_turnstile_token(&solved.html);
             login_html = solved.html;
@@ -271,8 +279,8 @@ impl AnimezClient {
             }
         }
 
-        let csrf_token = csrf_opt
-            .context("Could not find Laravel CSRF `_token` on animez.to login page")?;
+        let csrf_token =
+            csrf_opt.context("Could not find Laravel CSRF `_token` on animez.to login page")?;
 
         let post_url = Self::extract_login_action_url(base, &login_url, &login_html);
         let user_field_name = Self::extract_username_field_name(&login_html);
@@ -373,7 +381,9 @@ impl AnimezClient {
     fn extract_upload_action_url(base_url: &str, default_upload_url: &str, html: &str) -> String {
         let doc = Html::parse_document(html);
         let form_sel = Selector::parse("form").unwrap();
-        let torrent_sel = Selector::parse(r#"input[type="file"][name="torrent"], input[name="torrent"]"#).unwrap();
+        let torrent_sel =
+            Selector::parse(r#"input[type="file"][name="torrent"], input[name="torrent"]"#)
+                .unwrap();
         for form in doc.select(&form_sel) {
             if form.select(&torrent_sel).next().is_some() {
                 if let Some(action) = form.value().attr("action") {
@@ -548,9 +558,8 @@ impl AnimezClient {
             .map(|el| el.text().collect::<String>().trim().to_string())
             .unwrap_or_else(|| "Unknown Title".to_string());
 
-        let is_logged_in = html.contains("/logout")
-            || html.contains("upload")
-            || html.contains("passkey");
+        let is_logged_in =
+            html.contains("/logout") || html.contains("upload") || html.contains("passkey");
 
         Ok(format!(
             "Reachable (title='{}', authenticated={})",
@@ -653,11 +662,7 @@ impl AnimezClient {
                 let mut options = Vec::new();
                 if tag == "select" {
                     for opt_el in field_el.select(&option_sel) {
-                        let opt_val = opt_el
-                            .value()
-                            .attr("value")
-                            .unwrap_or_default()
-                            .to_string();
+                        let opt_val = opt_el.value().attr("value").unwrap_or_default().to_string();
                         let label = opt_el.text().collect::<String>().trim().to_string();
                         let selected = opt_el.value().attr("selected").is_some();
                         options.push(SelectOptionSchema {
@@ -749,13 +754,22 @@ impl AnimezClient {
                     let lower = name.to_ascii_lowercase();
                     if lower.contains("second") || lower.contains("2nd") || lower.contains(" ii") {
                         return Some(2);
-                    } else if lower.contains("third") || lower.contains("3rd") || lower.contains(" iii") {
+                    } else if lower.contains("third")
+                        || lower.contains("3rd")
+                        || lower.contains(" iii")
+                    {
                         return Some(3);
-                    } else if lower.contains("fourth") || lower.contains("4th") || lower.contains(" iv") {
+                    } else if lower.contains("fourth")
+                        || lower.contains("4th")
+                        || lower.contains(" iv")
+                    {
                         return Some(4);
                     } else if lower.contains("fifth") || lower.contains("5th") {
                         return Some(5);
-                    } else if lower.contains("sixth") || lower.contains("6th") || lower.contains(" vi") {
+                    } else if lower.contains("sixth")
+                        || lower.contains("6th")
+                        || lower.contains(" vi")
+                    {
                         return Some(6);
                     } else if lower.contains("first") || lower.contains("1st") {
                         return Some(1);
@@ -824,9 +838,8 @@ impl AnimezClient {
         let mut score = 0;
 
         static YEAR_STRIP_RE: OnceLock<Regex> = OnceLock::new();
-        let year_strip_re = YEAR_STRIP_RE.get_or_init(|| {
-            Regex::new(r"\b(?:19|20)\d{2}\b").unwrap()
-        });
+        let year_strip_re =
+            YEAR_STRIP_RE.get_or_init(|| Regex::new(r"\b(?:19|20)\d{2}\b").unwrap());
 
         for t_opt in titles_to_check.into_iter().flatten() {
             let norm_t = Self::normalize_title_for_lookup(t_opt);
@@ -844,10 +857,16 @@ impl AnimezClient {
                 score += 100;
                 title_matched = true;
                 break;
-            } else if (!norm_target_base.is_empty() && norm_target_base.len() >= 4 && norm_t.contains(&norm_target_base))
-                || (norm_t.len() >= 4 && !norm_target_base.is_empty() && norm_target_base.contains(&norm_t))
+            } else if (!norm_target_base.is_empty()
+                && norm_target_base.len() >= 4
+                && norm_t.contains(&norm_target_base))
+                || (norm_t.len() >= 4
+                    && !norm_target_base.is_empty()
+                    && norm_target_base.contains(&norm_t))
                 || (norm_target.len() >= 4 && norm_t.contains(&norm_target))
-                || (!norm_target_base.is_empty() && norm_target_base.len() >= 4 && norm_t_no_year.contains(&norm_target_base))
+                || (!norm_target_base.is_empty()
+                    && norm_target_base.len() >= 4
+                    && norm_t_no_year.contains(&norm_target_base))
             {
                 score += 60;
                 title_matched = true;
@@ -949,24 +968,37 @@ impl AnimezClient {
             return Ok(None);
         }
 
-        let mut search_res: AnimeSearchResponse = resp.json().await.unwrap_or(AnimeSearchResponse {
-            animes: Vec::new(),
-            torrents: Vec::new(),
-        });
+        let mut search_res: AnimeSearchResponse =
+            resp.json().await.unwrap_or(AnimeSearchResponse {
+                animes: Vec::new(),
+                torrents: Vec::new(),
+            });
 
         // If search returned empty and title contains season terms, try searching base title
         if search_res.animes.is_empty() {
             let stripped_query = title
                 .split_whitespace()
-                .take_while(|w| !w.eq_ignore_ascii_case("season") && !w.ends_with("nd") && !w.ends_with("rd") && !w.ends_with("th"))
+                .take_while(|w| {
+                    !w.eq_ignore_ascii_case("season")
+                        && !w.ends_with("nd")
+                        && !w.ends_with("rd")
+                        && !w.ends_with("th")
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             if !stripped_query.is_empty() && stripped_query != title.trim() {
                 let mut fallback_url = url::Url::parse(&format!("{base}/search"))?;
-                fallback_url.query_pairs_mut()
+                fallback_url
+                    .query_pairs_mut()
                     .append_pair("type", "anime")
                     .append_pair("q", stripped_query.trim());
-                if let Ok(f_resp) = self.http.get(fallback_url.as_str()).headers(self.build_ajax_headers(Some(fallback_url.as_str())).await?).send().await {
+                if let Ok(f_resp) = self
+                    .http
+                    .get(fallback_url.as_str())
+                    .headers(self.build_ajax_headers(Some(fallback_url.as_str())).await?)
+                    .send()
+                    .await
+                {
                     if f_resp.status().is_success() {
                         if let Ok(f_data) = f_resp.json::<AnimeSearchResponse>().await {
                             search_res = f_data;
@@ -1091,7 +1123,10 @@ impl AnimezClient {
             "url": clean_url
         });
 
-        debug!(url = clean_url, "Importing/resolving anime entry on AnimeZ via external URL");
+        debug!(
+            url = clean_url,
+            "Importing/resolving anime entry on AnimeZ via external URL"
+        );
         let resp = self
             .http
             .post(&url)
@@ -1207,7 +1242,10 @@ impl AnimezClient {
         for tr in doc.select(&tr_sel) {
             if let Some(a) = tr.select(&link_sel).next() {
                 let href = a.value().attr("href").unwrap_or_default();
-                if href.contains("/download") || href.ends_with("/torrents") || href.contains("/edit") {
+                if href.contains("/download")
+                    || href.ends_with("/torrents")
+                    || href.contains("/edit")
+                {
                     continue;
                 }
                 let title = a
@@ -1255,9 +1293,17 @@ impl AnimezClient {
                 // If video codec was missing from title, inspect table row badges/text
                 if parsed.video_codec.is_none() {
                     let r_upper = row_text.to_ascii_uppercase();
-                    if r_upper.contains("HEVC") || r_upper.contains("X265") || r_upper.contains("H.265") || r_upper.contains("H265") {
+                    if r_upper.contains("HEVC")
+                        || r_upper.contains("X265")
+                        || r_upper.contains("H.265")
+                        || r_upper.contains("H265")
+                    {
                         parsed.video_codec = Some("HEVC".to_string());
-                    } else if r_upper.contains("AVC") || r_upper.contains("X264") || r_upper.contains("H.264") || r_upper.contains("H264") {
+                    } else if r_upper.contains("AVC")
+                        || r_upper.contains("X264")
+                        || r_upper.contains("H.264")
+                        || r_upper.contains("H264")
+                    {
                         parsed.video_codec = Some("H.264".to_string());
                     } else if r_upper.contains("AV1") {
                         parsed.video_codec = Some("AV1".to_string());
@@ -1278,7 +1324,10 @@ impl AnimezClient {
         if results.is_empty() {
             for a in doc.select(&link_sel) {
                 let href = a.value().attr("href").unwrap_or_default();
-                if href.contains("/download") || href.ends_with("/torrents") || href.contains("/edit") {
+                if href.contains("/download")
+                    || href.ends_with("/torrents")
+                    || href.contains("/edit")
+                {
                     continue;
                 }
                 let title = a
@@ -1335,7 +1384,12 @@ impl AnimezClient {
         }
 
         let animez_entry = self
-            .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
+            .lookup_anime_entry(
+                &parsed.clean_title,
+                parsed.year,
+                parsed.season,
+                mal.map(|m| m.mal_id),
+            )
             .await
             .ok()
             .flatten();
@@ -1343,11 +1397,7 @@ impl AnimezClient {
         let anime_id = animez_entry.as_ref().map(|(id, _)| *id);
         let animez_title = animez_entry.as_ref().map(|(_, t)| t.as_str());
 
-        let torrent_name = crate::parser::format_animez_torrent_title(
-            parsed,
-            mal,
-            animez_title,
-        );
+        let torrent_name = crate::parser::format_animez_torrent_title(parsed, mal, animez_title);
 
         if dry_run || self.config.general.dry_run {
             info!(
@@ -1388,7 +1438,10 @@ impl AnimezClient {
 
         if let Some(m) = mal {
             let mal_url = format!("https://myanimelist.net/anime/{}", m.mal_id);
-            match self.import_or_resolve_anime(&mal_url, &csrf_token, &upload_url).await {
+            match self
+                .import_or_resolve_anime(&mal_url, &csrf_token, &upload_url)
+                .await
+            {
                 Ok(Some((aid, title))) => {
                     info!(
                         anime_id = aid,
@@ -1409,18 +1462,27 @@ impl AnimezClient {
         // Fallback: If anime entry is still unresolved, search Nyaa for canonical MAL/AniDB links
         if final_anime_id.is_none() {
             let mut search_candidates = Vec::new();
-            if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await {
+            if let Some(nyaa_view) =
+                crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await
+            {
                 search_candidates.push(nyaa_view);
             }
-            if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await {
+            if let Some(nyaa_view) =
+                crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await
+            {
                 if !search_candidates.contains(&nyaa_view) {
                     search_candidates.push(nyaa_view);
                 }
             }
             for candidate in search_candidates {
-                if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, &candidate).await {
+                if let Ok(links) =
+                    crate::parser::resolve_external_links_from_url(&self.http, &candidate).await
+                {
                     if let Some(ref m_url) = links.mal_url {
-                        if let Ok(Some((aid, title))) = self.import_or_resolve_anime(m_url, &csrf_token, &upload_url).await {
+                        if let Ok(Some((aid, title))) = self
+                            .import_or_resolve_anime(m_url, &csrf_token, &upload_url)
+                            .await
+                        {
                             info!(
                                 anime_id = aid,
                                 title = %title,
@@ -1433,7 +1495,10 @@ impl AnimezClient {
                         }
                     }
                     if let Some(ref a_url) = links.anidb_url {
-                        if let Ok(Some((aid, title))) = self.import_or_resolve_anime(a_url, &csrf_token, &upload_url).await {
+                        if let Ok(Some((aid, title))) = self
+                            .import_or_resolve_anime(a_url, &csrf_token, &upload_url)
+                            .await
+                        {
                             info!(
                                 anime_id = aid,
                                 title = %title,
@@ -1449,11 +1514,8 @@ impl AnimezClient {
             }
         }
 
-        let torrent_name = crate::parser::format_animez_torrent_title(
-            parsed,
-            mal,
-            final_anime_title.as_deref(),
-        );
+        let torrent_name =
+            crate::parser::format_animez_torrent_title(parsed, mal, final_anime_title.as_deref());
 
         // Step 2: Prepare multipart form
         let torrent_bytes = fs::read(&bundle.torrent_path).with_context(|| {
@@ -1548,18 +1610,21 @@ impl AnimezClient {
                     // If screenshot is an oversized legacy PNG (> 1MB), convert it to JPEG via ffmpeg
                     // so retried releases don't trigger HTTP 413 Payload Too Large.
                     let (final_path, mime) = if ext == "png" {
-                        let is_large = fs::metadata(shot_path).map(|m| m.len() > 1_000_000).unwrap_or(false);
+                        let is_large = fs::metadata(shot_path)
+                            .map(|m| m.len() > 1_000_000)
+                            .unwrap_or(false);
                         if is_large {
                             let jpg_path = shot_path.with_extension("jpg");
-                            let conv = tokio::process::Command::new(&self.config.packager.ffmpeg_bin)
-                                .arg("-y")
-                                .arg("-i")
-                                .arg(shot_path)
-                                .arg("-q:v")
-                                .arg("2")
-                                .arg(&jpg_path)
-                                .output()
-                                .await;
+                            let conv =
+                                tokio::process::Command::new(&self.config.packager.ffmpeg_bin)
+                                    .arg("-y")
+                                    .arg("-i")
+                                    .arg(shot_path)
+                                    .arg("-q:v")
+                                    .arg("2")
+                                    .arg(&jpg_path)
+                                    .output()
+                                    .await;
                             if let Ok(c_out) = conv {
                                 if c_out.status.success() && jpg_path.exists() {
                                     debug!(
@@ -1590,9 +1655,7 @@ impl AnimezClient {
                         .and_then(|s| s.to_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("screen_{idx}.jpg"));
-                    let part = Part::bytes(bytes)
-                        .file_name(fname)
-                        .mime_str(mime)?;
+                    let part = Part::bytes(bytes).file_name(fname).mime_str(mime)?;
                     form = form.part("screenshots[]", part);
                 }
             }
@@ -1687,41 +1750,64 @@ impl AnimezClient {
             }
 
             // Resolve AnimeZ internal anime entry (ID and canonical title)
-            let (pub_anime_id, pub_anime_title) = if let (Some(aid), Some(atitle)) = (final_anime_id, &final_anime_title) {
+            let (pub_anime_id, pub_anime_title) = if let (Some(aid), Some(atitle)) =
+                (final_anime_id, &final_anime_title)
+            {
                 (aid, atitle.clone())
             } else {
                 let mut resolved = None;
                 if let Some(m) = mal {
                     let mal_url = format!("https://myanimelist.net/anime/{}", m.mal_id);
-                    if let Ok(Some(entry)) = self.import_or_resolve_anime(&mal_url, &edit_csrf_token, &final_url).await {
+                    if let Ok(Some(entry)) = self
+                        .import_or_resolve_anime(&mal_url, &edit_csrf_token, &final_url)
+                        .await
+                    {
                         resolved = Some(entry);
                     }
                 }
                 if resolved.is_none() {
                     resolved = self
-                        .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
+                        .lookup_anime_entry(
+                            &parsed.clean_title,
+                            parsed.year,
+                            parsed.season,
+                            mal.map(|m| m.mal_id),
+                        )
                         .await?;
                 }
                 if resolved.is_none() {
                     let mut search_candidates = Vec::new();
-                    if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await {
+                    if let Some(nyaa_view) =
+                        crate::parser::find_nyaa_view_url(&self.http, &parsed.raw_title).await
+                    {
                         search_candidates.push(nyaa_view);
                     }
-                    if let Some(nyaa_view) = crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await {
+                    if let Some(nyaa_view) =
+                        crate::parser::find_nyaa_view_url(&self.http, &parsed.clean_title).await
+                    {
                         if !search_candidates.contains(&nyaa_view) {
                             search_candidates.push(nyaa_view);
                         }
                     }
                     for candidate in search_candidates {
-                        if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, &candidate).await {
+                        if let Ok(links) =
+                            crate::parser::resolve_external_links_from_url(&self.http, &candidate)
+                                .await
+                        {
                             if let Some(ref m_url) = links.mal_url {
-                                if let Ok(Some(entry)) = self.import_or_resolve_anime(m_url, &edit_csrf_token, &final_url).await {
+                                if let Ok(Some(entry)) = self
+                                    .import_or_resolve_anime(m_url, &edit_csrf_token, &final_url)
+                                    .await
+                                {
                                     resolved = Some(entry);
                                     break;
                                 }
                             }
                             if let Some(ref a_url) = links.anidb_url {
-                                if let Ok(Some(entry)) = self.import_or_resolve_anime(a_url, &edit_csrf_token, &final_url).await {
+                                if let Ok(Some(entry)) = self
+                                    .import_or_resolve_anime(a_url, &edit_csrf_token, &final_url)
+                                    .await
+                                {
                                     resolved = Some(entry);
                                     break;
                                 }
@@ -1816,7 +1902,9 @@ impl AnimezClient {
 
             // If screenshot is an oversized legacy PNG (> 1MB), convert to JPEG
             let (final_path, mime) = if ext == "png" {
-                let is_large = fs::metadata(shot_path).map(|m| m.len() > 1_000_000).unwrap_or(false);
+                let is_large = fs::metadata(shot_path)
+                    .map(|m| m.len() > 1_000_000)
+                    .unwrap_or(false);
                 if is_large {
                     let jpg_path = shot_path.with_extension("jpg");
                     let conv = tokio::process::Command::new(&self.config.packager.ffmpeg_bin)
@@ -1853,14 +1941,14 @@ impl AnimezClient {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("screenshot_{idx}.jpg"));
 
-            let part = Part::bytes(bytes)
-                .file_name(fname)
-                .mime_str(mime)?;
+            let part = Part::bytes(bytes).file_name(fname).mime_str(mime)?;
 
             let form = Form::new().part("screenshot", part);
 
             self.config.polite_sleep().await;
-            let headers = self.build_screenshot_headers(csrf_token, Some(referer)).await?;
+            let headers = self
+                .build_screenshot_headers(csrf_token, Some(referer))
+                .await?;
 
             let resp = self
                 .http
@@ -1869,7 +1957,9 @@ impl AnimezClient {
                 .multipart(form)
                 .send()
                 .await
-                .with_context(|| format!("Failed to POST screenshot {} to {url}", shot_path.display()))?;
+                .with_context(|| {
+                    format!("Failed to POST screenshot {} to {url}", shot_path.display())
+                })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -1924,11 +2014,7 @@ impl AnimezClient {
         let base = self.config.animez.base_url.trim_end_matches('/');
         let publish_url = format!("{base}/torrents/{torrent_id}");
 
-        let torrent_name = crate::parser::format_animez_torrent_title(
-            parsed,
-            mal,
-            anime_title,
-        );
+        let torrent_name = crate::parser::format_animez_torrent_title(parsed, mal, anime_title);
 
         let description = Self::build_release_description(parsed, mal);
         let format_val = Self::detect_release_format(parsed);
@@ -2006,7 +2092,9 @@ impl AnimezClient {
         let body = resp.text().await.unwrap_or_default();
 
         if !status.is_success() && !status.is_redirection() {
-            anyhow::bail!("Publishing draft torrent {torrent_id} failed with HTTP {status}: {body}");
+            anyhow::bail!(
+                "Publishing draft torrent {torrent_id} failed with HTTP {status}: {body}"
+            );
         }
 
         if final_url.ends_with("/edit") {
@@ -2060,9 +2148,9 @@ impl AnimezClient {
         html: &str,
     ) -> Option<String> {
         let doc = Html::parse_document(html);
-        if let Ok(sel) = Selector::parse(
-            r#"a[href*="/download"], a[href$=".torrent"], a.btn-download-torrent"#,
-        ) {
+        if let Ok(sel) =
+            Selector::parse(r#"a[href*="/download"], a[href$=".torrent"], a.btn-download-torrent"#)
+        {
             for a in doc.select(&sel) {
                 if let Some(href) = a.value().attr("href") {
                     if href.starts_with("http") {
@@ -2220,7 +2308,8 @@ mod tests {
             AnimezClient::normalize_title_for_lookup("Ranma 1/2 (2024)!"),
             "ranma 12 2024"
         );
-        let err_html = r#"<div class="alert alert-danger">At least 3 screenshots required to publish.</div>"#;
+        let err_html =
+            r#"<div class="alert alert-danger">At least 3 screenshots required to publish.</div>"#;
         assert_eq!(
             AnimezClient::extract_form_errors(err_html),
             "At least 3 screenshots required to publish."
@@ -2260,7 +2349,9 @@ mod tests {
             Some(36128)
         );
         assert_eq!(
-            AnimezClient::extract_torrent_id_from_url("https://animez.to/torrents/36128-slug-title"),
+            AnimezClient::extract_torrent_id_from_url(
+                "https://animez.to/torrents/36128-slug-title"
+            ),
             Some(36128)
         );
         assert_eq!(
@@ -2289,7 +2380,12 @@ mod tests {
 
         // Fallback when HTML has no matching download button
         assert_eq!(
-            AnimezClient::extract_download_torrent_url(base, page_url, "<html><body>No button</body></html>").as_deref(),
+            AnimezClient::extract_download_torrent_url(
+                base,
+                page_url,
+                "<html><body>No button</body></html>"
+            )
+            .as_deref(),
             Some("https://animez.to/torrents/36128/download")
         );
     }
@@ -2336,7 +2432,10 @@ mod tests {
             "Season 2 item must outscore Season 1 item when target_season is 2 (got S2={score_s2_for_s2}, S1={score_s1_for_s2})"
         );
         assert!(score_s2_for_s2 > 0);
-        assert_eq!(score_s1_for_s2, -999, "Season 1 item must be completely disqualified for Season 2 target");
+        assert_eq!(
+            score_s1_for_s2, -999,
+            "Season 1 item must be completely disqualified for Season 2 target"
+        );
 
         // Looking for Season 1: S1 must beat S2 decisively
         let score_s1_for_s1 = AnimezClient::score_anime_candidate(
@@ -2358,6 +2457,9 @@ mod tests {
             "Season 1 item must outscore Season 2 item when target_season is 1 (got S1={score_s1_for_s1}, S2={score_s2_for_s1})"
         );
         assert!(score_s1_for_s1 > 0);
-        assert_eq!(score_s2_for_s1, -999, "Season 2 item must be completely disqualified for Season 1 target");
+        assert_eq!(
+            score_s2_for_s1, -999,
+            "Season 2 item must be completely disqualified for Season 1 target"
+        );
     }
 }

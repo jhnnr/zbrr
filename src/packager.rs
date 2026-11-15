@@ -136,7 +136,9 @@ impl Packager {
         let screenshots = if skip_screenshots {
             Vec::new()
         } else {
-            let shots = self.extract_screenshots(&primary_video, &bundle_dir).await?;
+            let shots = self
+                .extract_screenshots(&primary_video, &bundle_dir)
+                .await?;
             if shots.len() < 6 {
                 anyhow::bail!(
                     "Media packaging produced only {} screenshots; AnimeZ upload rules (Section 6) strictly require a minimum of 6 screenshots for anime uploads.",
@@ -243,7 +245,10 @@ impl Packager {
         video_path: &Path,
         output_dir: &Path,
     ) -> Result<Vec<PathBuf>> {
-        let duration_secs = self.probe_video_duration(video_path).await.unwrap_or(1440.0);
+        let duration_secs = self
+            .probe_video_duration(video_path)
+            .await
+            .unwrap_or(1440.0);
         let target_count = self.config.packager.screenshot_count.max(6);
 
         let mut candidate_positions = self.config.packager.screenshot_positions.clone();
@@ -251,7 +256,9 @@ impl Packager {
             candidate_positions = vec![0.10, 0.25, 0.40, 0.55, 0.70, 0.85];
         }
         // Build fallback pool with backup evenly spaced positions
-        let fallback_pool = [0.18, 0.33, 0.48, 0.63, 0.78, 0.15, 0.30, 0.45, 0.60, 0.75, 0.80, 0.08, 0.50];
+        let fallback_pool = [
+            0.18, 0.33, 0.48, 0.63, 0.78, 0.15, 0.30, 0.45, 0.60, 0.75, 0.80, 0.08, 0.50,
+        ];
         for p in fallback_pool {
             if !candidate_positions.iter().any(|&cp| (cp - p).abs() < 0.03) {
                 candidate_positions.push(p);
@@ -332,22 +339,62 @@ impl Packager {
         quality_str: &str,
     ) -> bool {
         // 1. Fast seek (-ss before -i)
-        if Self::run_ffmpeg_capture(ffmpeg_bin, video_path, shot_path, ts_secs, true, ext, quality_str).await {
+        if Self::run_ffmpeg_capture(
+            ffmpeg_bin,
+            video_path,
+            shot_path,
+            ts_secs,
+            true,
+            ext,
+            quality_str,
+        )
+        .await
+        {
             return true;
         }
 
         // 2. Accurate output seek (-ss after -i) in case keyframe jumping failed
-        if Self::run_ffmpeg_capture(ffmpeg_bin, video_path, shot_path, ts_secs, false, ext, quality_str).await {
+        if Self::run_ffmpeg_capture(
+            ffmpeg_bin,
+            video_path,
+            shot_path,
+            ts_secs,
+            false,
+            ext,
+            quality_str,
+        )
+        .await
+        {
             return true;
         }
 
         // 3. Fallback stepped slightly earlier in case ts_secs is near or past video EOF
         for step in [0.90, 0.80, 0.70] {
             let alt_ts = (ts_secs * step).max(0.1);
-            if Self::run_ffmpeg_capture(ffmpeg_bin, video_path, shot_path, alt_ts, true, ext, quality_str).await {
+            if Self::run_ffmpeg_capture(
+                ffmpeg_bin,
+                video_path,
+                shot_path,
+                alt_ts,
+                true,
+                ext,
+                quality_str,
+            )
+            .await
+            {
                 return true;
             }
-            if Self::run_ffmpeg_capture(ffmpeg_bin, video_path, shot_path, alt_ts, false, ext, quality_str).await {
+            if Self::run_ffmpeg_capture(
+                ffmpeg_bin,
+                video_path,
+                shot_path,
+                alt_ts,
+                false,
+                ext,
+                quality_str,
+            )
+            .await
+            {
                 return true;
             }
         }
@@ -387,7 +434,10 @@ impl Packager {
             .arg("scale=iw*sar:ih");
 
         if ext == "jpg" || ext == "jpeg" {
-            cmd.arg("-pix_fmt").arg("yuvj420p").arg("-q:v").arg(quality_str);
+            cmd.arg("-pix_fmt")
+                .arg("yuvj420p")
+                .arg("-q:v")
+                .arg(quality_str);
         } else if ext == "webp" {
             cmd.arg("-c:v").arg("libwebp").arg("-quality").arg("85");
         }
@@ -449,8 +499,14 @@ impl Packager {
         }
 
         let txt = String::from_utf8_lossy(&out.stdout);
-        let first = txt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        let ms: f64 = first.parse().context("Failed to parse mediainfo duration ms")?;
+        let first = txt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let ms: f64 = first
+            .parse()
+            .context("Failed to parse mediainfo duration ms")?;
         Ok(ms / 1000.0)
     }
 
@@ -473,8 +529,14 @@ impl Packager {
         }
 
         let txt = String::from_utf8_lossy(&out.stdout);
-        let first = txt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        let secs: f64 = first.parse().context("Failed to parse ffprobe stream duration")?;
+        let first = txt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let secs: f64 = first
+            .parse()
+            .context("Failed to parse ffprobe stream duration")?;
         Ok(secs)
     }
 
@@ -495,8 +557,14 @@ impl Packager {
         }
 
         let txt = String::from_utf8_lossy(&out.stdout);
-        let first = txt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        let secs: f64 = first.parse().context("Failed to parse ffprobe format duration")?;
+        let first = txt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let secs: f64 = first
+            .parse()
+            .context("Failed to parse ffprobe format duration")?;
         Ok(secs)
     }
 }
@@ -521,7 +589,9 @@ fn sanitize_staging_name(name: &str) -> String {
     let mut s: String = name
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']' | '(' | ')' | ' ') {
+            if c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '[' | ']' | '(' | ')' | ' ')
+            {
                 c
             } else {
                 '_'
@@ -545,7 +615,9 @@ mod tests {
         let sample = "General\nUnique ID : 12345\nComplete name                            : C:\\media\\downloads\\animez-staging\\[SubsPlease] Frieren - 01 (1080p).mkv\nFormat : Matroska";
         let sanitized = sanitize_mediainfo_output(sample, "[SubsPlease] Frieren - 01 (1080p).mkv");
         assert!(!sanitized.contains("C:\\media\\downloads"));
-        assert!(sanitized.contains("Complete name                            : [SubsPlease] Frieren - 01 (1080p).mkv"));
+        assert!(sanitized.contains(
+            "Complete name                            : [SubsPlease] Frieren - 01 (1080p).mkv"
+        ));
     }
 
     #[tokio::test]
@@ -572,7 +644,11 @@ mod tests {
                 config.packager.screenshot_count = 6;
                 let packager = Packager::new(config);
                 let shots = packager.extract_screenshots(&video_path, &shots_dir).await;
-                assert!(shots.is_ok(), "Screenshot extraction should succeed: {:?}", shots.err());
+                assert!(
+                    shots.is_ok(),
+                    "Screenshot extraction should succeed: {:?}",
+                    shots.err()
+                );
                 let shots = shots.unwrap();
                 assert_eq!(shots.len(), 6, "Should extract exactly 6 screenshots");
                 for s in shots {

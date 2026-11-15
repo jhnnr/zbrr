@@ -120,7 +120,10 @@ async fn main() -> Result<()> {
             println!("\n--- Package Bundle Created ---");
             println!("Torrent File    : {}", bundle.torrent_path.display());
             println!("InfoHash (SHA1) : {}", bundle.torrent_info_hash);
-            println!("Payload Size    : {} bytes ({} files)", bundle.total_size_bytes, bundle.file_count);
+            println!(
+                "Payload Size    : {} bytes ({} files)",
+                bundle.total_size_bytes, bundle.file_count
+            );
             println!("Piece Length    : {} bytes", bundle.piece_length);
             println!("MediaInfo File  : {}", bundle.mediainfo_path.display());
             println!("Screenshots     : {}", bundle.screenshots.len());
@@ -172,9 +175,7 @@ async fn main() -> Result<()> {
 
         Commands::Retry { id, now } => {
             let new_state = pipeline.db().reset_for_retry(id)?;
-            println!(
-                "Reset release #{id} to state {new_state}."
-            );
+            println!("Reset release #{id} to state {new_state}.");
             if now {
                 pipeline.process_release_by_id(id, cli.dry_run).await?;
             }

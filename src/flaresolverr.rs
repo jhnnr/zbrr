@@ -276,7 +276,10 @@ impl FlareSolverrClient {
             cookies: input_cookies,
         };
 
-        info!(url = target_url, "Requesting Cloudflare clearance via FlareSolverr");
+        info!(
+            url = target_url,
+            "Requesting Cloudflare clearance via FlareSolverr"
+        );
         let resp = self
             .http
             .post(&self.config.flaresolverr.url)

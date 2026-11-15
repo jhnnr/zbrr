@@ -107,22 +107,28 @@ ZBRR_ANIMEZ_PID=your_animez_pid_here
    - Implement multi-stage seek fallbacks for every screenshot: fast input seek (`-ss <ts> -i`), accurate output seek (`-i -ss <ts>`), and stepped earlier timestamps (`0.90x`, `0.80x`, `0.70x`).
    - Use a rich candidate position pool (`10%`, `25%`, `40%`, `55%`, `70%`, `85%`, plus fallback pool `18%`, `33%`, `48%`, etc.) to guarantee AnimeZ's strict 6-screenshot minimum without aborting when sparse keyframes or timestamps near EOF miss.
 
-6. **Ongoing Series Catch-Up & Batch Creation (`dupe_checker.rs` & `parser.rs`):**
-   - Strictly obey AnimeZ Section 3 upload rules. If a release is a mid-season standalone episode (`N > 1`) and the user has not established a sequence, search Prowlarr for missing prior episodes (`01 ~ N-1`), download them into staging, and package as a complete batch `[AniDB Title] - 01~N (Year) [Group] [Tags]`.
-   - Prevent double-year redundancy in generated torrent titles (e.g. `Ranma 1/2 (2024) - 01 (2026)` instead of `(2026) ... (2026)`).
+6. **Ongoing Series Catch-Up & Batch Folder Creation (`dupe_checker.rs`, `pipeline.rs` & `parser.rs`):**
+   - Strictly obey AnimeZ Section 3 upload rules. When starting mid-season at episode `N > 1` without prior sequence, download all aired prior episodes (`01` through `N-1`) matching group, resolution, source, and codec.
+   - Combine all episodes into a single directory (`[Group] Title - 01~N...`) and create a multi-file `.torrent` for the folder (`[AniDB Title] - 01~N (Year) [Group] [Tags]`).
+   - Hold individual constituent episodes in staging; never upload single episodes mid-season.
+   - Once the catch-up batch is seeded, subsequent weekly episodes are uploaded individually as they air.
 
-7. **AnimeZ Auto-Import & Multi-Source Canonical MAL Scraper (`animez_client.rs`, `pipeline.rs` & `parser.rs`):**
+7. **Season Finale Batch Creation & Started Series Priority (`pipeline.rs`):**
+   - **Season Finale**: When the last episode of a season/series is reached (via MAL episode count or `[END]`/`[FINAL]`), combine all episodes `01~Final` into 1 folder and upload a complete season batch.
+   - **Started Series Priority**: If any series in `animez-seeding` is missing Episode 01 or has broken sequence coverage, prioritize searching Prowlarr for missing prior episodes and completing that started series. Defer general discovery of brand-new anime series until started series are caught up.
+
+8. **AnimeZ Auto-Import & Multi-Source Canonical MAL Scraper (`animez_client.rs`, `pipeline.rs` & `parser.rs`):**
    - For torrents found on Nyaa, inspect the `Information` link (e.g., Erai-raws anime list page) to obtain the canonical MyAnimeList URL and AniDB URL.
    - Use `resolve_mal_for_release` in both Stage 2 and Stage 5: checks `record.info_url`, `record.guid` (if URL), rewrites `nyaa.si/download/` URLs to `nyaa.si/view/`, queries Nyaa search via `find_nyaa_view_url`, and follows external `Information:` links.
    - Persist discovered `mal_id` via `db.update_mal_id`—never call `set_dupe_checked` during `Packaging` or `Uploading` stages as that demotes the release state.
    - Auto-import the anime on `animez.to` via `POST /anime` (using CSRF tokens) if it is missing from the tracker database before uploading. If draft publishing encounters an unindexed title, fall back to querying Nyaa for MAL/AniDB links and trigger auto-import before failing.
    - Ensure strict season matching: never upload Season 2 under a Season 1 anime entry.
 
-8. **Staging Adoption & Active Seeding Series Priority (`pipeline.rs`):**
+9. **Staging Adoption & Active Seeding Series Priority (`pipeline.rs`):**
    - Check `animez-staging` before starting new Prowlarr downloads. Completed staging downloads must be adopted into SQLite and prioritized straight into the packaging pipeline.
    - Prioritize incoming episodes for anime series currently seeding in `animez-seeding`.
 
-9. **qBittorrent Prowlarr URL Authentication & Registration Checks (`qbittorrent.rs`):**
+10. **qBittorrent Prowlarr URL Authentication & Registration Checks (`qbittorrent.rs`):**
    - When adding torrent download URLs that point to Prowlarr, always ensure the Prowlarr API key query parameter (`?apikey=...`) is appended so qBittorrent does not fail with HTTP 401 Unauthorized.
    - Poll qBittorrent immediately after adding a torrent to verify active registration in the transfer list before polling download progress, timing out early (30s) if qBittorrent rejected the torrent.
 

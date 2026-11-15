@@ -1,4 +1,6 @@
-use crate::models::{DiscoveredRelease, MalMetadata, PackageBundle, ParsedRelease, ReleaseRecord, ReleaseState};
+use crate::models::{
+    DiscoveredRelease, MalMetadata, PackageBundle, ParsedRelease, ReleaseRecord, ReleaseState,
+};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,7 +27,10 @@ impl Database {
 
     fn connect(&self) -> Result<Connection> {
         let conn = Connection::open(&self.db_path).with_context(|| {
-            format!("Failed to open SQLite database at {}", self.db_path.display())
+            format!(
+                "Failed to open SQLite database at {}",
+                self.db_path.display()
+            )
         })?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -333,16 +338,14 @@ impl Database {
         let mut records = Vec::new();
 
         if let Some(st) = state_filter {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM releases WHERE state = ?1 ORDER BY id DESC LIMIT ?2",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT * FROM releases WHERE state = ?1 ORDER BY id DESC LIMIT ?2")?;
             let rows = stmt.query_map(params![st.as_str(), limit as i64], Self::map_row)?;
             for row in rows {
                 records.push(row?);
             }
         } else {
-            let mut stmt =
-                conn.prepare("SELECT * FROM releases ORDER BY id DESC LIMIT ?1")?;
+            let mut stmt = conn.prepare("SELECT * FROM releases ORDER BY id DESC LIMIT ?1")?;
             let rows = stmt.query_map(params![limit as i64], Self::map_row)?;
             for row in rows {
                 records.push(row?);
@@ -411,7 +414,8 @@ impl Database {
 
     pub fn get_release_by_source_hash(&self, hash: &str) -> Result<Option<ReleaseRecord>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT * FROM releases WHERE LOWER(source_info_hash) = LOWER(?1) LIMIT 1")?;
+        let mut stmt = conn
+            .prepare("SELECT * FROM releases WHERE LOWER(source_info_hash) = LOWER(?1) LIMIT 1")?;
         let mut rows = stmt.query_map(params![hash.trim()], Self::map_row)?;
         if let Some(r) = rows.next() {
             Ok(Some(r?))
@@ -582,13 +586,13 @@ impl Database {
         Ok(())
     }
 
-    /// Checks if SQLite already tracks a successfully uploaded / seeding release for this anime.
-    pub fn has_prior_upload_for_anime(
+    /// Returns the highest contiguous episode number seeded starting from episode 01 for this anime and season.
+    pub fn get_seeded_episode_coverage(
         &self,
         clean_title: &str,
+        season: u32,
         mal_id: Option<u64>,
-        season: Option<u32>,
-    ) -> Result<bool> {
+    ) -> Result<u32> {
         let conn = self.connect()?;
         let norm_prefix: String = clean_title
             .to_ascii_lowercase()
@@ -599,57 +603,213 @@ impl Database {
             .collect::<Vec<_>>()
             .join("_");
 
-        let target_season = season.unwrap_or(1);
-        let season_token = format!("|s{target_season:02}");
+        let season_token = format!("|s{season:02}");
+        let mut covered_up_to = 0;
+        let mut single_eps = std::collections::HashSet::new();
 
-        // 1. Check by MAL ID if available, but strictly verify that it matches target_season
+        // 1. Query by mal_id if available
         if let Some(mid) = mal_id {
             let mut stmt = conn.prepare(
-                "SELECT normalized_key, parsed_json FROM releases WHERE state = 'SEEDING' AND mal_id = ?1",
+                "SELECT normalized_key, parsed_json, raw_title FROM releases WHERE state = 'SEEDING' AND mal_id = ?1",
             )?;
             let rows = stmt.query_map(params![mid as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                let (key, parsed_json) = row?;
-                if key.contains(&season_token) {
-                    return Ok(true);
+                let (key, pj, raw_title) = row?;
+                if !key.contains(&season_token) {
+                    continue;
                 }
-                if let Some(pj) = parsed_json {
-                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&pj) {
-                        if parsed.season.unwrap_or(1) == target_season {
-                            return Ok(true);
+                if let Some(json_str) = pj {
+                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&json_str) {
+                        if parsed.season.unwrap_or(1) != season {
+                            continue;
+                        }
+                        if parsed.is_season_pack {
+                            if let Some((start, end)) =
+                                crate::parser::parse_batch_episode_range(&raw_title).or_else(|| {
+                                    crate::parser::parse_batch_episode_range(&parsed.raw_title)
+                                })
+                            {
+                                if start <= 1 {
+                                    covered_up_to = covered_up_to.max(end);
+                                }
+                            }
+                        } else if let Some(ep) = parsed.episode {
+                            single_eps.insert(ep);
                         }
                     }
                 }
             }
         }
 
-        // 2. Check by normalized title & season in normalized_key
+        // 2. Query by normalized title prefix
         if !norm_prefix.is_empty() {
             let mut stmt = conn.prepare(
-                "SELECT normalized_key, parsed_json FROM releases WHERE state = 'SEEDING' AND normalized_key LIKE ?1 LIMIT 20",
+                "SELECT normalized_key, parsed_json, raw_title FROM releases WHERE state = 'SEEDING' AND normalized_key LIKE ?1",
             )?;
             let like_pat = format!("{norm_prefix}%");
             let rows = stmt.query_map(params![like_pat], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             for row in rows {
-                let (key, parsed_json) = row?;
-                if key.contains(&season_token) {
-                    return Ok(true);
+                let (key, pj, raw_title) = row?;
+                if !key.contains(&season_token) {
+                    continue;
                 }
-                if let Some(pj) = parsed_json {
-                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&pj) {
-                        if parsed.season.unwrap_or(1) == target_season {
-                            return Ok(true);
+                if let Some(json_str) = pj {
+                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&json_str) {
+                        if parsed.season.unwrap_or(1) != season {
+                            continue;
+                        }
+                        if parsed.is_season_pack {
+                            if let Some((start, end)) =
+                                crate::parser::parse_batch_episode_range(&raw_title).or_else(|| {
+                                    crate::parser::parse_batch_episode_range(&parsed.raw_title)
+                                })
+                            {
+                                if start <= 1 {
+                                    covered_up_to = covered_up_to.max(end);
+                                }
+                            }
+                        } else if let Some(ep) = parsed.episode {
+                            single_eps.insert(ep);
                         }
                     }
                 }
             }
         }
 
-        Ok(false)
+        while single_eps.contains(&(covered_up_to + 1)) {
+            covered_up_to += 1;
+        }
+
+        Ok(covered_up_to)
+    }
+
+    /// Checks if SQLite already tracks a successfully uploaded / seeding release sequence starting from episode 01 for this anime.
+    pub fn has_prior_upload_for_anime(
+        &self,
+        clean_title: &str,
+        mal_id: Option<u64>,
+        season: Option<u32>,
+    ) -> Result<bool> {
+        let cov = self.get_seeded_episode_coverage(clean_title, season.unwrap_or(1), mal_id)?;
+        Ok(cov > 0)
+    }
+
+    /// Finds a release record that has a downloaded content_path on disk for a specific anime, season, and episode.
+    pub fn find_completed_episode_file_for_anime(
+        &self,
+        clean_title: &str,
+        season: u32,
+        episode: u32,
+    ) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let season_token = format!("|s{season:02}");
+        let ep_token = format!("e{episode:02}|");
+
+        let mut stmt = conn.prepare(
+            "SELECT * FROM releases WHERE content_path IS NOT NULL AND normalized_key LIKE ?1 ORDER BY id DESC LIMIT 50",
+        )?;
+        let like_pat = format!("{norm_prefix}%");
+        let rows = stmt.query_map(params![like_pat], Self::map_row)?;
+        for r in rows {
+            let rec = r?;
+            if rec.normalized_key.contains(&season_token) && rec.normalized_key.contains(&ep_token)
+            {
+                return Ok(Some(rec));
+            }
+            if let Ok(p) = rec.parsed() {
+                if p.season.unwrap_or(1) == season && p.episode == Some(episode) {
+                    return Ok(Some(rec));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Finds the highest known episode number across all tracked releases for an anime and season.
+    pub fn find_highest_known_episode_for_anime(
+        &self,
+        clean_title: &str,
+        season: u32,
+        mal_id: Option<u64>,
+    ) -> Result<u32> {
+        let conn = self.connect()?;
+        let norm_prefix: String = clean_title
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+
+        let season_token = format!("|s{season:02}");
+        let mut max_ep = 0;
+
+        let mut check_row = |pj: Option<String>, raw_title: String| {
+            if let Some((_start, end)) = crate::parser::parse_batch_episode_range(&raw_title) {
+                max_ep = max_ep.max(end);
+            }
+            if let Some(json_str) = pj {
+                if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&json_str) {
+                    if parsed.season.unwrap_or(1) == season {
+                        if let Some((_start, end)) =
+                            crate::parser::parse_batch_episode_range(&parsed.raw_title)
+                        {
+                            max_ep = max_ep.max(end);
+                        } else if let Some(ep) = parsed.episode {
+                            max_ep = max_ep.max(ep);
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(mid) = mal_id {
+            let mut stmt =
+                conn.prepare("SELECT parsed_json, raw_title FROM releases WHERE mal_id = ?1")?;
+            let rows = stmt.query_map(params![mid as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            for r in rows {
+                let (pj, rt) = r?;
+                check_row(pj, rt);
+            }
+        }
+
+        if !norm_prefix.is_empty() {
+            let like_pat = format!("{norm_prefix}%");
+            let mut stmt = conn.prepare("SELECT normalized_key, parsed_json, raw_title FROM releases WHERE normalized_key LIKE ?1")?;
+            let rows = stmt.query_map(params![like_pat], |r| {
+                Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            for r in rows {
+                let (key, pj, rt) = r?;
+                if key.contains(&season_token) {
+                    check_row(pj, rt);
+                }
+            }
+        }
+
+        Ok(max_ep)
     }
 
     /// Un-skips any releases for an anime that were previously postponed due to the ongoing catch-up rule.

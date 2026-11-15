@@ -60,17 +60,18 @@ impl QbittorrentClient {
     }
 
     fn base_url(&self) -> String {
-        self.config.qbittorrent.url.trim_end_matches('/').to_string()
+        self.config
+            .qbittorrent
+            .url
+            .trim_end_matches('/')
+            .to_string()
     }
 
     /// Returns the configured qBittorrent API key (`Authorization: Bearer <api_key>`),
     /// or an error if it is missing or still set to a template placeholder.
     fn api_key(&self) -> Result<&str> {
         let key = self.config.qbittorrent.api_key.trim();
-        if key.is_empty()
-            || key.starts_with("REPLACE_")
-            || key.starts_with("your_")
-        {
+        if key.is_empty() || key.starts_with("REPLACE_") || key.starts_with("your_") {
             anyhow::bail!(
                 "qBittorrent API key is not configured (set ZBRR_QBITTORRENT_API_KEY in .env)"
             );
@@ -236,7 +237,10 @@ impl QbittorrentClient {
             }
 
             // Check staging category for title or hash match
-            if let Ok(torrents) = self.list_torrents(Some(&self.config.qbittorrent.staging_category)).await {
+            if let Ok(torrents) = self
+                .list_torrents(Some(&self.config.qbittorrent.staging_category))
+                .await
+            {
                 for t in torrents {
                     if t.name.eq_ignore_ascii_case(&release.title)
                         || release.title.contains(&t.name)
@@ -300,8 +304,7 @@ impl QbittorrentClient {
     /// Polls `/api/v2/torrents/info` until download reaches 100% completion.
     pub async fn wait_for_completion(&self, info_hash: &str) -> Result<QbitTorrentInfo> {
         let timeout = Duration::from_secs(self.config.qbittorrent.download_timeout_secs.max(60));
-        let poll_interval =
-            Duration::from_secs(self.config.qbittorrent.poll_interval_secs.max(2));
+        let poll_interval = Duration::from_secs(self.config.qbittorrent.poll_interval_secs.max(2));
         let started = Instant::now();
         let not_found_timeout = Duration::from_secs(30);
         let mut not_found_since: Option<Instant> = None;

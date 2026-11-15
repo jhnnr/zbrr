@@ -885,7 +885,13 @@ mod tests {
 
         load_env_file_safe(&env_file);
         assert_eq!(env::var("TEST_VAR_REMOTE").unwrap(), "/downloads");
-        assert_eq!(env::var("TEST_VAR_LOCAL").unwrap(), "\\\\server\\share\\folder");
-        assert_eq!(env::var("TEST_VAR_NEXT").unwrap(), "http://docker.lan:8191/v1");
+        assert_eq!(
+            env::var("TEST_VAR_LOCAL").unwrap(),
+            "\\\\server\\share\\folder"
+        );
+        assert_eq!(
+            env::var("TEST_VAR_NEXT").unwrap(),
+            "http://docker.lan:8191/v1"
+        );
     }
 }

@@ -295,8 +295,7 @@ fn read_stream_range(spans: &[DiskFileSpan], offset: u64, len: usize) -> Result<
     let end_stream_pos = offset + (len as u64);
 
     // Binary search for the first file containing `cur_stream_pos`
-    let start_idx = spans
-        .partition_point(|s| s.stream_offset + s.length <= cur_stream_pos);
+    let start_idx = spans.partition_point(|s| s.stream_offset + s.length <= cur_stream_pos);
 
     for span in &spans[start_idx..] {
         if cur_stream_pos >= end_stream_pos {
