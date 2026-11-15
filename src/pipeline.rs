@@ -872,18 +872,50 @@ impl Pipeline {
         // Stage 3b: DOWNLOADING -> PACKAGING
         // ---------------------------------------------------------------------
         if record.state == ReleaseState::Downloading {
-            let info_hash = record
+            let mut info_hash = record
                 .source_info_hash
-                .as_deref()
+                .clone()
                 .context("Release in DOWNLOADING state is missing source_info_hash")?;
+
+            // Verify if the torrent actually exists in qBittorrent before polling
+            let torrent_exists = self.qbit.get_torrent_info(&info_hash).await?.is_some();
+            if !torrent_exists {
+                info!(
+                    id = id,
+                    title = %record.raw_title,
+                    hash = %info_hash,
+                    "Torrent in DOWNLOADING state is missing from qBittorrent; attempting to re-add source download"
+                );
+                let disc = DiscoveredRelease {
+                    guid: record.guid.clone(),
+                    title: record.raw_title.clone(),
+                    indexer_id: record.indexer_id,
+                    indexer_name: record.indexer_name.clone(),
+                    download_url: record.download_url.clone(),
+                    magnet_url: record.magnet_url.clone(),
+                    info_hash: record.source_info_hash.clone(),
+                    size_bytes: record.size_bytes,
+                    seeders: record.seeders,
+                    leechers: 0,
+                    publish_date: None,
+                    info_url: record.info_url.clone(),
+                };
+
+                let new_hash = self.qbit.add_source_download(&disc).await?;
+                let db_dl = self.db.clone();
+                let hash_clone = new_hash.clone();
+                tokio::task::spawn_blocking(move || db_dl.set_downloading(id, &hash_clone)).await??;
+                record.source_info_hash = Some(new_hash.clone());
+                info_hash = new_hash;
+            }
 
             info!(
                 id = id,
                 title = %record.raw_title,
-                hash = info_hash,
+                hash = %info_hash,
                 "Polling qBittorrent for download completion"
             );
-            let qbit_info = self.qbit.wait_for_completion(info_hash).await?;
+            let qbit_info = self.qbit.wait_for_completion(&info_hash).await?;
 
             let raw_content_path = if !qbit_info.content_path.trim().is_empty() {
                 qbit_info.content_path.clone()

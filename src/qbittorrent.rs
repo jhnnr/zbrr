@@ -120,6 +120,27 @@ impl QbittorrentClient {
         Ok(())
     }
 
+    fn attach_prowlarr_api_key_if_needed(&self, url: &str) -> String {
+        let api_key = self.config.prowlarr.api_key.trim();
+        if api_key.is_empty() || url.contains("apikey=") {
+            return url.to_string();
+        }
+
+        let is_prowlarr = url.starts_with(&self.config.prowlarr.url)
+            || url.contains("/api/v1/indexer/")
+            || url.contains("/1/api?");
+
+        if is_prowlarr {
+            if url.contains('?') {
+                format!("{url}&apikey={api_key}")
+            } else {
+                format!("{url}?apikey={api_key}")
+            }
+        } else {
+            url.to_string()
+        }
+    }
+
     /// Adds a discovered release to qBittorrent under `staging_category` and `tag`,
     /// returning the torrent's 40-char hex `info_hash`.
     pub async fn add_source_download(&self, release: &DiscoveredRelease) -> Result<String> {
@@ -143,7 +164,12 @@ impl QbittorrentClient {
         let mut torrent_bytes_opt: Option<Vec<u8>> = None;
         if let Some(dl_url) = &release.download_url {
             if dl_url.starts_with("http") {
-                if let Ok(resp) = self.http.get(dl_url).send().await {
+                let auth_dl_url = self.attach_prowlarr_api_key_if_needed(dl_url);
+                let mut req = self.http.get(&auth_dl_url);
+                if !self.config.prowlarr.api_key.trim().is_empty() {
+                    req = req.header("X-Api-Key", self.config.prowlarr.api_key.trim());
+                }
+                if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
                         if let Ok(bytes) = resp.bytes().await {
                             if bytes.first().copied() == Some(b'd') {
@@ -174,7 +200,8 @@ impl QbittorrentClient {
         } else if let Some(mag) = &release.magnet_url {
             form = form.text("urls", mag.clone());
         } else if let Some(dl_url) = &release.download_url {
-            form = form.text("urls", dl_url.clone());
+            let auth_url = self.attach_prowlarr_api_key_if_needed(dl_url);
+            form = form.text("urls", auth_url);
         } else {
             anyhow::bail!("Release has no usable download_url or magnet_url");
         }
@@ -190,38 +217,53 @@ impl QbittorrentClient {
             anyhow::bail!("qBittorrent add torrent returned HTTP {}", resp.status());
         }
 
-        if let Some(hash) = expected_hash {
-            info!(
-                title = %release.title,
-                hash = %hash,
-                category = %self.config.qbittorrent.staging_category,
-                "Added source torrent to qBittorrent"
-            );
-            return Ok(hash);
+        // Verify that the torrent was actually registered in qBittorrent!
+        let wait_limit = Duration::from_secs(15);
+        let poll_step = Duration::from_millis(500);
+        let start = Instant::now();
+
+        while start.elapsed() < wait_limit {
+            if let Some(ref hash) = expected_hash {
+                if let Ok(Some(info)) = self.get_torrent_info(hash).await {
+                    info!(
+                        title = %release.title,
+                        hash = %info.hash,
+                        category = %self.config.qbittorrent.staging_category,
+                        "Added source torrent to qBittorrent and verified registration"
+                    );
+                    return Ok(info.hash.to_ascii_lowercase());
+                }
+            }
+
+            // Check staging category for title or hash match
+            if let Ok(torrents) = self.list_torrents(Some(&self.config.qbittorrent.staging_category)).await {
+                for t in torrents {
+                    if t.name.eq_ignore_ascii_case(&release.title)
+                        || release.title.contains(&t.name)
+                        || t.name.contains(&release.title)
+                    {
+                        info!(
+                            title = %release.title,
+                            hash = %t.hash,
+                            "Resolved and verified info_hash from qBittorrent staging category"
+                        );
+                        return Ok(t.hash.to_ascii_lowercase());
+                    }
+                }
+            }
+
+            tokio::time::sleep(poll_step).await;
         }
 
-        // Fallback: Wait briefly and find the newly added torrent in staging_category
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let torrents = self
-            .list_torrents(Some(&self.config.qbittorrent.staging_category))
-            .await?;
-
-        for t in torrents {
-            if t.name.eq_ignore_ascii_case(&release.title)
-                || release.title.contains(&t.name)
-                || t.name.contains(&release.title)
-            {
-                info!(
-                    title = %release.title,
-                    hash = %t.hash,
-                    "Resolved info_hash from qBittorrent active torrent list"
-                );
-                return Ok(t.hash.to_ascii_lowercase());
+        // Final check for expected_hash in any category
+        if let Some(hash) = expected_hash {
+            if let Ok(Some(info)) = self.get_torrent_info(&hash).await {
+                return Ok(info.hash.to_ascii_lowercase());
             }
         }
 
         anyhow::bail!(
-            "Added torrent '{}' to qBittorrent but could not resolve its info_hash",
+            "Added torrent '{}' to qBittorrent but it failed to appear in client after 15s (invalid URL/magnet or connection error)",
             release.title
         )
     }
@@ -261,9 +303,13 @@ impl QbittorrentClient {
         let poll_interval =
             Duration::from_secs(self.config.qbittorrent.poll_interval_secs.max(2));
         let started = Instant::now();
+        let not_found_timeout = Duration::from_secs(30);
+        let mut not_found_since: Option<Instant> = None;
 
         loop {
             if let Some(info) = self.get_torrent_info(info_hash).await? {
+                not_found_since = None;
+
                 if info.is_completed() {
                     info!(
                         name = %info.name,
@@ -291,7 +337,22 @@ impl QbittorrentClient {
                     "Waiting for qBittorrent download completion"
                 );
             } else {
-                debug!(hash = info_hash, "Torrent not yet visible in qBittorrent info list");
+                let first_not_found = not_found_since.get_or_insert_with(Instant::now);
+                let elapsed_not_found = first_not_found.elapsed();
+
+                debug!(
+                    hash = info_hash,
+                    elapsed_secs = elapsed_not_found.as_secs(),
+                    "Torrent not yet visible in qBittorrent info list"
+                );
+
+                if elapsed_not_found >= not_found_timeout {
+                    anyhow::bail!(
+                        "Torrent with hash '{}' is not present in qBittorrent (not found for {}s)",
+                        info_hash,
+                        not_found_timeout.as_secs()
+                    );
+                }
             }
 
             if started.elapsed() >= timeout {
@@ -426,5 +487,29 @@ mod tests {
             extract_btih_from_magnet(mag).as_deref(),
             Some("1234567890abcdef1234567890abcdef12345678")
         );
+    }
+
+    #[test]
+    fn test_attach_prowlarr_api_key_if_needed() {
+        let mut config = AppConfig::default();
+        config.prowlarr.url = "http://prowlarr.lan:9696".to_string();
+        config.prowlarr.api_key = "secret_prowlarr_key".to_string();
+
+        let client = QbittorrentClient::new(config).unwrap();
+
+        // Already has apikey
+        let u1 = "http://prowlarr.lan:9696/api/v1/indexer/8/download?link=abc&apikey=existing";
+        assert_eq!(client.attach_prowlarr_api_key_if_needed(u1), u1);
+
+        // Prowlarr URL with query params
+        let u2 = "http://prowlarr.lan:9696/api/v1/indexer/8/download?link=abc";
+        assert_eq!(
+            client.attach_prowlarr_api_key_if_needed(u2),
+            "http://prowlarr.lan:9696/api/v1/indexer/8/download?link=abc&apikey=secret_prowlarr_key"
+        );
+
+        // Non-prowlarr URL
+        let u3 = "https://nyaa.si/download/12345.torrent";
+        assert_eq!(client.attach_prowlarr_api_key_if_needed(u3), u3);
     }
 }
