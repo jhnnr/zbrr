@@ -230,7 +230,7 @@ Example output:
   [OK]   mediainfo (mediainfo): MediaInfo Command line, v24.11
 
 [2/5] SQLite State Database:
-  [OK]   SQLite WAL database initialized at C:\Users\johnn\.zbrr\state.db
+  [OK]   SQLite WAL database initialized at ~/.zbrr/state.db
 
 [3/5] Prowlarr Server (http://prowlarr.lan:9696):
   [OK]   Prowlarr v2.7.0.5723
@@ -269,10 +269,10 @@ Verify torrent creation, MediaInfo extraction, and screenshot capturing on an ex
 
 ```powershell
 # Package a single episode
-zbrr package-local "F:\Downloads\Anime\[SubsPlease] Dandadan - 07 (1080p) [1234ABCD].mkv"
+zbrr package-local "path/to/[SubsPlease] Dandadan - 07 (1080p) [1234ABCD].mkv"
 
 # Package a season folder without screenshots
-zbrr package-local "F:\Downloads\Anime\[Judas] Cyberpunk Edgerunners (Season 1) [1080p]" --skip-screenshots
+zbrr package-local "path/to/[Judas] Cyberpunk Edgerunners (Season 1) [1080p]" --skip-screenshots
 ```
 
 Outputs will be generated under `~/.zbrr/staging/<release_name>/`:
@@ -415,19 +415,19 @@ zbrr/
 - Run `zbrr doctor` to verify binary detection.
 - If `ffmpeg`, `ffprobe`, or `mediainfo` are not in your system `PATH`, configure their absolute paths in `.env`:
   ```dotenv
-  ZBRR_PACKAGER_FFMPEG_BIN=C:\Tools\ffmpeg\bin\ffmpeg.exe
-  ZBRR_PACKAGER_FFPROBE_BIN=C:\Tools\ffmpeg\bin\ffprobe.exe
-  ZBRR_PACKAGER_MEDIAINFO_BIN=C:\Tools\MediaInfo\mediainfo.exe
+  ZBRR_PACKAGER_FFMPEG_BIN=/usr/bin/ffmpeg
+  ZBRR_PACKAGER_FFPROBE_BIN=/usr/bin/ffprobe
+  ZBRR_PACKAGER_MEDIAINFO_BIN=/usr/bin/mediainfo
   ```
 </details>
 
 <details>
 <summary><strong>4. Cross-platform path mapping between qBittorrent and zbrr</strong></summary>
 
-- If qBittorrent runs in Docker/WSL (`/downloads/anime/...`) while `zbrr` runs natively on Windows (`F:\Downloads\anime\...`), configure prefix mapping in `.env`:
+- If qBittorrent runs in Docker/WSL (`/downloads/anime/...`) while `zbrr` runs on another host or path (`/media/downloads/anime/...`), configure prefix mapping in `.env`:
   ```dotenv
   ZBRR_QBITTORRENT_REMOTE_PATH_PREFIX=/downloads
-  ZBRR_QBITTORRENT_LOCAL_PATH_PREFIX=F:\Downloads
+  ZBRR_QBITTORRENT_LOCAL_PATH_PREFIX=/media/downloads
   ```
 </details>
 

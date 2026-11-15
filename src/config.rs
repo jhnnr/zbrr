@@ -826,7 +826,7 @@ impl AppConfig {
     }
 
     /// Maps a remote qBittorrent path (e.g., `/downloads/Anime/Show.mkv` in Docker)
-    /// to a local Windows path (`F:\Downloads\Anime\Show.mkv`) if configured.
+    /// to a local host path (e.g., `/media/downloads/Anime/Show.mkv` or `D:\Downloads\Anime\Show.mkv`) if configured.
     pub fn map_qbit_path_to_local(&self, qbit_path: &str) -> PathBuf {
         let remote_prefix = self.qbittorrent.remote_path_prefix.trim();
         let local_prefix = self.qbittorrent.local_path_prefix.trim();

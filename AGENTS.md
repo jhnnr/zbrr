@@ -74,7 +74,7 @@ DISCOVERED -> DUPE_CHECKED -> DOWNLOADING -> PACKAGING -> UPLOADING -> SEEDING
 ## 4. Target Directory Layout
 
 ```text
-F:\Dev Stuff\zbrr\
+zbrr/
 ├── AGENTS.md
 ├── CLAUDE.md
 ├── Cargo.toml

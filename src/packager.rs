@@ -501,7 +501,7 @@ impl Packager {
     }
 }
 
-/// Replaces full local disk paths in `Complete name : F:\Downloads\...` with just the filename.
+/// Replaces full local disk paths in `Complete name : /path/to/...` with just the filename.
 pub fn sanitize_mediainfo_output(raw: &str, filename_only: &str) -> String {
     let mut cleaned_lines = Vec::new();
     for line in raw.lines() {
@@ -542,9 +542,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_mediainfo_strips_windows_path() {
-        let sample = "General\nUnique ID : 12345\nComplete name                            : F:\\Downloads\\animez-staging\\[SubsPlease] Frieren - 01 (1080p).mkv\nFormat : Matroska";
+        let sample = "General\nUnique ID : 12345\nComplete name                            : C:\\media\\downloads\\animez-staging\\[SubsPlease] Frieren - 01 (1080p).mkv\nFormat : Matroska";
         let sanitized = sanitize_mediainfo_output(sample, "[SubsPlease] Frieren - 01 (1080p).mkv");
-        assert!(!sanitized.contains("F:\\Downloads"));
+        assert!(!sanitized.contains("C:\\media\\downloads"));
         assert!(sanitized.contains("Complete name                            : [SubsPlease] Frieren - 01 (1080p).mkv"));
     }
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (and other AI coding assistants) when working with the Rust codebase in `F:\Dev Stuff\zbrr`.
+This file provides guidance to Claude Code (and other AI coding assistants) when working with this codebase.
 
 Read [AGENTS.md](./AGENTS.md) first for the full system architecture, pipeline state machine, and private-tracker safety rules.
 
@@ -10,7 +10,6 @@ Read [AGENTS.md](./AGENTS.md) first for the full system architecture, pipeline s
 
 - **Language & Stack:** Rust (2021 edition, `tokio` async runtime, `reqwest`, `rusqlite` bundled, `clap`, `scraper`, `serde_bencode`, `rayon`, `sha1`).
 - **Goal:** Automate grabbing anime releases (`.torrent` & magnet links) from a **Prowlarr** server, downloading them in **qBittorrent**, packaging them (parallel `.torrent` creation, MediaInfo via `mediainfo` CLI, robust high-quality screenshots via `ffmpeg`, metadata via filename parser + Nyaa/Jikan MAL resolution), uploading to **animez.to** via direct HTTP + **FlareSolverr** + session cookies, and injecting the tracker's re-signed `.torrent` back into qBittorrent for immediate seeding.
-- **OS Environment:** Windows (`F:\Dev Stuff\zbrr`). Always use `std::path::{Path, PathBuf}` so Windows drive letters and paths are handled cleanly across qBittorrent, `ffmpeg`, and `serde_bencode`.
 
 ---
 
@@ -32,7 +31,7 @@ cargo run -- doctor
 cargo run -- inspect-form
 
 # Test creating a .torrent + MediaInfo + Screenshots on a local file/folder
-cargo run -- package-local "F:\Downloads\Some.Anime.Episode.mkv"
+cargo run -- package-local "path/to/Some.Anime.Episode.mkv"
 
 # Run a single poll-and-package cycle in dry-run mode (no live tracker upload)
 cargo run -- once --dry-run
