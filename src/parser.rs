@@ -10,6 +10,116 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Determines if a string extracted from square brackets is likely a release/fansub group name
+/// rather than a technical specification tag, container, audio/video codec, resolution, or CRC32 hash.
+pub fn is_potential_release_group(candidate: &str) -> bool {
+    let s = candidate.trim();
+    if s.is_empty() || s.len() > 30 {
+        return false;
+    }
+
+    // 1. CRC32 [8 hex characters]
+    if s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // 2. 4-digit Year [19xx or 20xx]
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(y) = s.parse::<u32>() {
+            if (1950..=2050).contains(&y) {
+                return false;
+            }
+        }
+    }
+
+    let upper = s.to_ascii_uppercase().replace(['.', '-', '_'], "");
+
+    // 3. Resolutions
+    if matches!(
+        upper.as_str(),
+        "2160P" | "1080P" | "720P" | "576P" | "480P" | "4K" | "1920X1080" | "1280X720" | "3840X2160"
+    ) {
+        return false;
+    }
+
+    // 4. Video Codecs
+    if matches!(
+        upper.as_str(),
+        "HEVC" | "X265" | "H265" | "AVC" | "X264" | "H264" | "AV1" | "XVID"
+    ) {
+        return false;
+    }
+
+    // 5. Sources / Rip types
+    if matches!(
+        upper.as_str(),
+        "WEBDL" | "WEBRIP" | "BLURAY" | "BD" | "BDRIP" | "BRRIP" | "HDTV" | "DVD" | "DVDRIP" | "REMUX" | "CR" | "CRUNCHYROLL" | "NF" | "NETFLIX" | "AMZN" | "AMAZON" | "BGLOBAL" | "HIDI"
+    ) {
+        return false;
+    }
+
+    // 6. Audio Codecs & Channels
+    if matches!(
+        upper.as_str(),
+        "AAC" | "FLAC" | "AC3" | "EAC3" | "DDP" | "OPUS" | "TRUEHD" | "DTS" | "DTSHD" | "DTSHDMA" | "MP3" | "DUALAUDIO" | "MULTIAUDIO" | "ENGLISHDUBBED" | "ENGDUB" | "DUBBED" | "DUB"
+    ) || upper.starts_with("AAC") || upper.starts_with("FLAC") {
+        return false;
+    }
+
+    // 7. Bit depth
+    if matches!(upper.as_str(), "10BIT" | "8BIT" | "HI10P") {
+        return false;
+    }
+
+    // 8. Subtitle / Language / Version / Pack tags
+    if matches!(
+        upper.as_str(),
+        "MULTISUB" | "MULTISUBS" | "MSUB" | "MSUBS" | "SOFTSUBS" | "HARDSUBS" | "RAW" | "ENGSUB" | "SUB" | "SUBS" | "BATCH" | "COMPLETE" | "V1" | "V2" | "V3" | "V4"
+    ) {
+        return false;
+    }
+
+    // 9. HDR tags
+    if matches!(upper.as_str(), "HDR" | "HDR10" | "HDR10+" | "DV" | "DOVI" | "DOLBYVISION" | "SDR") {
+        return false;
+    }
+
+    // 10. If candidate contains spaces and words like "1080p", "CR", "WEBRip", it's a composite technical bracket
+    if s.contains(' ') {
+        let has_technical_tokens = s.split_whitespace().any(|tok| {
+            let u = tok.to_ascii_uppercase().replace(['.', '-', '_'], "");
+            matches!(
+                u.as_str(),
+                "1080P" | "720P" | "2160P" | "HEVC" | "X265" | "H265" | "AVC" | "X264" | "H264" | "WEBRIP" | "WEBDL" | "BLURAY" | "BD" | "AAC" | "FLAC" | "EAC3" | "CR" | "NF" | "AMZN"
+            )
+        });
+        if has_technical_tokens {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Returns the canonical video codec string ("hevc", "h264", "av1", "xvid") for matching and key generation.
+pub fn canonical_codec(vc: Option<&str>) -> &'static str {
+    match vc {
+        Some(s) => {
+            let u = s.to_ascii_uppercase();
+            if u.contains("HEVC") || u.contains("X265") || u.contains("H265") || u.contains("H.265") {
+                "hevc"
+            } else if u.contains("AV1") {
+                "av1"
+            } else if u.contains("XVID") {
+                "xvid"
+            } else {
+                "h264"
+            }
+        }
+        None => "h264",
+    }
+}
+
 /// Parses an anime release filename or title into structured metadata.
 pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
     let mut parsed = ParsedRelease {
@@ -17,7 +127,10 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         ..Default::default()
     };
 
-    let mut working = raw_input.trim().to_string();
+    let mut working = raw_input
+        .trim()
+        .trim_start_matches(|c: char| c == '#' || c.is_whitespace())
+        .to_string();
 
     // 1. Strip known media container extension at the end
     static EXT_RE: OnceLock<Regex> = OnceLock::new();
@@ -40,8 +153,10 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
     let lead_group_re = LEAD_GROUP_RE.get_or_init(|| Regex::new(r"^\s*\[([^\[\]]+)\]\s*").unwrap());
     if let Some(caps) = lead_group_re.captures(&working) {
         let candidate = caps[1].trim().to_string();
-        parsed.release_group = Some(candidate);
-        working = lead_group_re.replace(&working, "").to_string();
+        if is_potential_release_group(&candidate) {
+            parsed.release_group = Some(candidate);
+            working = lead_group_re.replace(&working, "").to_string();
+        }
     }
 
     // 4. Resolution
@@ -156,7 +271,22 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         }
     }
 
-    // 11. Trailing scene-style group if not already found: e.g., "-VARYG" at end
+    // 11. Extract release group if not already found from leading bracket:
+    // Check all non-leading square brackets (standard AnimeZ / tracker naming convention: Title - 01 (Year) [Group] [Tags...])
+    if parsed.release_group.is_none() {
+        static ALL_BRACKETS_RE: OnceLock<Regex> = OnceLock::new();
+        let all_brackets_re =
+            ALL_BRACKETS_RE.get_or_init(|| Regex::new(r"\[([^\[\]]+)\]").unwrap());
+        for caps in all_brackets_re.captures_iter(&working) {
+            let candidate = caps[1].trim();
+            if is_potential_release_group(candidate) {
+                parsed.release_group = Some(candidate.to_string());
+                break;
+            }
+        }
+    }
+
+    // Trailing scene-style group if not already found: e.g., "-VARYG" at end
     if parsed.release_group.is_none() {
         static TRAIL_GROUP_RE: OnceLock<Regex> = OnceLock::new();
         let trail_group_re =
@@ -303,12 +433,19 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
     static MULTI_SPACE_RE: OnceLock<Regex> = OnceLock::new();
     let multi_space_re = MULTI_SPACE_RE.get_or_init(|| Regex::new(r"\s+").unwrap());
     let clean_title = multi_space_re
-        .replace_all(raw_clean.trim().trim_end_matches(['-', '.', '_']), " ")
+        .replace_all(
+            raw_clean
+                .trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_end_matches(['-', '.', '_', '#']),
+            " ",
+        )
         .trim()
         .to_string();
 
     parsed.clean_title = if clean_title.is_empty() {
-        raw_input.trim().to_string()
+        raw_input.trim().trim_start_matches('#').trim().to_string()
     } else {
         clean_title
     };
@@ -332,6 +469,7 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         _ => "movie_or_ova".to_string(),
     };
 
+    let codec_part = canonical_codec(parsed.video_codec.as_deref());
     let res_part = parsed
         .resolution
         .as_deref()
@@ -343,7 +481,7 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         .unwrap_or("nogroup")
         .to_ascii_lowercase();
 
-    parsed.normalized_key = format!("{norm_title}|{ep_part}|{res_part}|{group_part}");
+    parsed.normalized_key = format!("{norm_title}|{ep_part}|{res_part}|{codec_part}|{group_part}");
     parsed
 }
 
@@ -726,8 +864,39 @@ mod tests {
         assert_eq!(p.container.as_deref(), Some("MKV"));
         assert_eq!(
             p.normalized_key,
-            "sousou_no_frieren|s01e28|1080p|subsplease"
+            "sousou_no_frieren|s01e28|1080p|h264|subsplease"
         );
+    }
+
+    #[test]
+    fn test_parse_animez_standard_format_titles() {
+        // AnimeZ standard naming: Title - 01 (Year) [Group]
+        let p1 = parse_anime_release("Romelia Senki - 01 (2026) [SubsPlease]");
+        assert_eq!(p1.clean_title, "Romelia Senki");
+        assert_eq!(p1.episode, Some(1));
+        assert_eq!(p1.release_group.as_deref(), Some("SubsPlease"));
+        assert_eq!(p1.video_codec.as_deref(), None);
+
+        // Leading '#' from tracker badge/table formatting
+        let p2 = parse_anime_release("#Zombie Sagashitemasu - 01 (2026) [SubsPlease]");
+        assert_eq!(p2.clean_title, "Zombie Sagashitemasu");
+        assert_eq!(p2.episode, Some(1));
+        assert_eq!(p2.release_group.as_deref(), Some("SubsPlease"));
+
+        // AnimeZ title with [Group] and [HEVC] tag
+        let p3 = parse_anime_release("Marronnier Oukoku no Shichinin no Kishi - 07 (2026) [Erai-raws] [HEVC]");
+        assert_eq!(p3.clean_title, "Marronnier Oukoku no Shichinin no Kishi");
+        assert_eq!(p3.episode, Some(7));
+        assert_eq!(p3.release_group.as_deref(), Some("Erai-raws"));
+        assert_eq!(p3.video_codec.as_deref(), Some("HEVC"));
+
+        // AnimeZ title with numeric group name [030]
+        let p4 = parse_anime_release("Sister Breeder - 01-06 (2026) [030] [HEVC] [10-bit]");
+        assert_eq!(p4.clean_title, "Sister Breeder");
+        assert!(p4.is_season_pack);
+        assert_eq!(p4.release_group.as_deref(), Some("030"));
+        assert_eq!(p4.video_codec.as_deref(), Some("HEVC"));
+        assert_eq!(p4.bit_depth.as_deref(), Some("10bit"));
     }
 
     #[test]

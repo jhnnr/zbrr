@@ -767,7 +767,9 @@ impl Pipeline {
                 {
                     let is_starter = cand_parsed.is_season_pack
                         || cand_parsed.episode.is_some_and(|ep| ep <= 1);
-                    if is_starter && rec.state == ReleaseState::Skipped {
+                    if is_starter
+                        && (rec.state == ReleaseState::Skipped || rec.state == ReleaseState::Failed)
+                    {
                         let db_reset = self.db.clone();
                         let rec_id = rec.id;
                         let _ = tokio::task::spawn_blocking(move || {
@@ -777,7 +779,7 @@ impl Pipeline {
                         info!(
                             id = rec_id,
                             title = %rec.raw_title,
-                            "Unskipped previously SKIPPED catch-up starter release to DISCOVERED state"
+                            "Rescued catch-up starter release to DISCOVERED state"
                         );
                     }
                 }

@@ -24,6 +24,7 @@ pub struct TrackerTorrentEntry {
     pub url: String,
     pub resolution: Option<String>,
     pub group: Option<String>,
+    pub video_codec: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1098,35 +1099,123 @@ impl AnimezClient {
             r#"a.torrent-link, a.torrent-filename, a.view-torrent, td.torrent-name a, a[href*="/torrent/"], a[href*="/torrents/"]"#,
         )
         .unwrap();
+        let tr_sel = Selector::parse("tr").unwrap();
 
         let mut results = Vec::new();
-        for a in doc.select(&link_sel) {
-            let href = a.value().attr("href").unwrap_or_default();
-            if href.contains("/download") || href.ends_with("/torrents") || href.contains("/edit") {
-                continue;
-            }
-            let title = a.text().collect::<String>().trim().to_string();
-            if title.len() < 4 {
-                continue;
-            }
-            let full_url = if href.starts_with("http") {
-                href.to_string()
-            } else {
-                format!(
-                    "{}/{}",
-                    base_url.trim_end_matches('/'),
-                    href.trim_start_matches('/')
-                )
-            };
+        let mut seen_urls = std::collections::HashSet::new();
 
-            let parsed = crate::parser::parse_anime_release(&title);
-            results.push(TrackerTorrentEntry {
-                title,
-                url: full_url,
-                resolution: parsed.resolution,
-                group: parsed.release_group,
-            });
+        // 1. First attempt: iterate over table rows to capture resolution/codec badges in same row
+        for tr in doc.select(&tr_sel) {
+            if let Some(a) = tr.select(&link_sel).next() {
+                let href = a.value().attr("href").unwrap_or_default();
+                if href.contains("/download") || href.ends_with("/torrents") || href.contains("/edit") {
+                    continue;
+                }
+                let title = a
+                    .text()
+                    .collect::<String>()
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_string();
+                if title.len() < 4 {
+                    continue;
+                }
+                let full_url = if href.starts_with("http") {
+                    href.to_string()
+                } else {
+                    format!(
+                        "{}/{}",
+                        base_url.trim_end_matches('/'),
+                        href.trim_start_matches('/')
+                    )
+                };
+                if !seen_urls.insert(full_url.clone()) {
+                    continue;
+                }
+
+                let row_text = tr.text().collect::<String>();
+                let mut parsed = crate::parser::parse_anime_release(&title);
+
+                // If resolution was missing from title, inspect table row badges/text
+                if parsed.resolution.is_none() {
+                    let r_upper = row_text.to_ascii_uppercase();
+                    if r_upper.contains("2160P") || r_upper.contains("4K") {
+                        parsed.resolution = Some("2160p".to_string());
+                    } else if r_upper.contains("1080P") {
+                        parsed.resolution = Some("1080p".to_string());
+                    } else if r_upper.contains("720P") {
+                        parsed.resolution = Some("720p".to_string());
+                    } else if r_upper.contains("576P") {
+                        parsed.resolution = Some("576p".to_string());
+                    } else if r_upper.contains("480P") {
+                        parsed.resolution = Some("480p".to_string());
+                    }
+                }
+
+                // If video codec was missing from title, inspect table row badges/text
+                if parsed.video_codec.is_none() {
+                    let r_upper = row_text.to_ascii_uppercase();
+                    if r_upper.contains("HEVC") || r_upper.contains("X265") || r_upper.contains("H.265") || r_upper.contains("H265") {
+                        parsed.video_codec = Some("HEVC".to_string());
+                    } else if r_upper.contains("AVC") || r_upper.contains("X264") || r_upper.contains("H.264") || r_upper.contains("H264") {
+                        parsed.video_codec = Some("H.264".to_string());
+                    } else if r_upper.contains("AV1") {
+                        parsed.video_codec = Some("AV1".to_string());
+                    }
+                }
+
+                results.push(TrackerTorrentEntry {
+                    title,
+                    url: full_url,
+                    resolution: parsed.resolution,
+                    group: parsed.release_group,
+                    video_codec: parsed.video_codec,
+                });
+            }
         }
+
+        // 2. Fallback if no table rows were matched (e.g. non-table layout)
+        if results.is_empty() {
+            for a in doc.select(&link_sel) {
+                let href = a.value().attr("href").unwrap_or_default();
+                if href.contains("/download") || href.ends_with("/torrents") || href.contains("/edit") {
+                    continue;
+                }
+                let title = a
+                    .text()
+                    .collect::<String>()
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_string();
+                if title.len() < 4 {
+                    continue;
+                }
+                let full_url = if href.starts_with("http") {
+                    href.to_string()
+                } else {
+                    format!(
+                        "{}/{}",
+                        base_url.trim_end_matches('/'),
+                        href.trim_start_matches('/')
+                    )
+                };
+                if !seen_urls.insert(full_url.clone()) {
+                    continue;
+                }
+
+                let parsed = crate::parser::parse_anime_release(&title);
+                results.push(TrackerTorrentEntry {
+                    title,
+                    url: full_url,
+                    resolution: parsed.resolution,
+                    group: parsed.release_group,
+                    video_codec: parsed.video_codec,
+                });
+            }
+        }
+
         results
     }
 

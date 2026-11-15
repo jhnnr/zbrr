@@ -56,6 +56,7 @@ impl DupeChecker {
                                 url: i.guid,
                                 resolution: p.resolution,
                                 group: p.release_group,
+                                video_codec: p.video_codec,
                             }
                         })
                         .collect();
@@ -198,7 +199,16 @@ impl DupeChecker {
         existing_entries: &[TrackerTorrentEntry],
     ) -> Option<TrackerTorrentEntry> {
         for entry in existing_entries {
-            let existing_parsed = parse_anime_release(&entry.title);
+            let mut existing_parsed = parse_anime_release(&entry.title);
+            if existing_parsed.resolution.is_none() && entry.resolution.is_some() {
+                existing_parsed.resolution = entry.resolution.clone();
+            }
+            if existing_parsed.release_group.is_none() && entry.group.is_some() {
+                existing_parsed.release_group = entry.group.clone();
+            }
+            if existing_parsed.video_codec.is_none() && entry.video_codec.is_some() {
+                existing_parsed.video_codec = entry.video_codec.clone();
+            }
             if Self::is_same_release(candidate, &existing_parsed) {
                 return Some(entry.clone());
             }
@@ -207,7 +217,7 @@ impl DupeChecker {
     }
 
     /// Compares two parsed releases to determine if they represent the same release
-    /// (same anime title + season/episode/pack + resolution + release group).
+    /// (same anime title + season/episode/pack + resolution + video codec + release group).
     pub fn is_same_release(a: &ParsedRelease, b: &ParsedRelease) -> bool {
         if a.normalized_key == b.normalized_key {
             return true;
@@ -239,7 +249,14 @@ impl DupeChecker {
             }
         }
 
-        // Compare release group if both have one
+        // Compare video codec (e.g. HEVC vs H.264/AVC can coexist per AnimeZ upload rules)
+        let codec_a = crate::parser::canonical_codec(a.video_codec.as_deref());
+        let codec_b = crate::parser::canonical_codec(b.video_codec.as_deref());
+        if codec_a != codec_b {
+            return false;
+        }
+
+        // Compare release group if both have one (different groups are NOT duplicates)
         if let (Some(ga), Some(gb)) = (&a.release_group, &b.release_group) {
             if !ga.eq_ignore_ascii_case(gb) {
                 return false;
@@ -286,6 +303,47 @@ mod tests {
             "[Erai-raws] Sousou no Frieren - 12 (1080p) [ABCDEF12].mkv",
         );
         assert!(!DupeChecker::is_same_release(&candidate, &diff_group));
+
+        // AnimeZ tracker standard title tests (Romelia Senki / SubsPlease vs Erai-raws)
+        let erai_romelia = parse_anime_release(
+            "[Erai-raws] Romelia Senki - 01 [1080p CR WEBRip HEVC AAC][MultiSub][AAD97B02].mkv",
+        );
+        let subsplease_romelia = parse_anime_release("Romelia Senki - 01 (2026) [SubsPlease]");
+        assert!(
+            !DupeChecker::is_same_release(&erai_romelia, &subsplease_romelia),
+            "Erai-raws and SubsPlease releases must NOT be considered duplicates"
+        );
+
+        // Leading '#' from tracker table badges
+        let erai_zombie = parse_anime_release(
+            "[Erai-raws] Zombie Sagashitemasu - 01 [1080p CR WEB-DL AVC AAC][MultiSub][231C13D4].mkv",
+        );
+        let subsplease_zombie = parse_anime_release("#Zombie Sagashitemasu - 01 (2026) [SubsPlease]");
+        assert!(
+            !DupeChecker::is_same_release(&erai_zombie, &subsplease_zombie),
+            "Erai-raws and SubsPlease releases with '#' prefix must NOT be considered duplicates"
+        );
+
+        // HEVC vs AVC video codecs from same group must NOT be considered duplicates
+        let erai_hevc = parse_anime_release(
+            "[Erai-raws] Tensei shita Daiseijo wa, Seijo de Aru Koto wo Hitakakusu - 01 [1080p CR WEBRip HEVC AAC][MultiSub][842DB762].mkv",
+        );
+        let erai_avc = parse_anime_release(
+            "[Erai-raws] Tensei shita Daiseijo wa Seijo de Aru Koto wo Hitakakusu - 01 [1080p CR WEB-DL AVC AAC][MultiSub][3FD480A0].mkv",
+        );
+        assert!(
+            !DupeChecker::is_same_release(&erai_hevc, &erai_avc),
+            "HEVC and AVC releases from same group must NOT be duplicates (coexistence permitted)"
+        );
+
+        // True duplicate: Same group, same episode, same codec
+        let erai_hevc_tracker = parse_anime_release(
+            "Romelia Senki - 01 (2026) [Erai-raws] [HEVC]",
+        );
+        assert!(
+            DupeChecker::is_same_release(&erai_romelia, &erai_hevc_tracker),
+            "Same group, episode, and codec must match as duplicate"
+        );
     }
 
     #[tokio::test]

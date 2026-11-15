@@ -665,7 +665,7 @@ impl Database {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT * FROM releases
-                WHERE state = 'SKIPPED'
+                WHERE state IN ('SKIPPED', 'FAILED')
                   AND mal_id = ?1
                 "#,
             )?;
@@ -680,7 +680,7 @@ impl Database {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT * FROM releases
-                WHERE state = 'SKIPPED'
+                WHERE state IN ('SKIPPED', 'FAILED')
                   AND normalized_key LIKE ?1
                 "#,
             )?;
