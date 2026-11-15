@@ -10,6 +10,17 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Normalizes a title into a lowercase underscore-separated alphanumeric string.
+pub fn normalize_title(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 /// Determines if a string extracted from square brackets is likely a release/fansub group name
 /// rather than a technical specification tag, container, audio/video codec, resolution, or CRC32 hash.
 pub fn is_potential_release_group(candidate: &str) -> bool {
@@ -310,11 +321,17 @@ pub fn parse_anime_release(raw_input: &str) -> ParsedRelease {
         BRACKET_RE.get_or_init(|| Regex::new(r"(\[[^\[\]]*\]|\([^\(\)]*\))").unwrap());
 
     // Before stripping brackets, check if any bracket indicates Batch / Season
+    static SEASON_PART_DASH_RE: OnceLock<Regex> = OnceLock::new();
+    let season_part_dash_re = SEASON_PART_DASH_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:Season\s*\d{1,2}|Part\s*\d{1,2}|Cour\s*\d{1,2}|Vol(?:ume)?\s*\d{1,2}|S\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season|(?:First|Second|Third|Fourth|Fifth|Sixth)\s*Season)\s*-\s*").unwrap()
+    });
+    let working_no_season_prefix = season_part_dash_re.replace_all(&working, " ");
+
     static BATCH_RE: OnceLock<Regex> = OnceLock::new();
     let batch_re = BATCH_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(Batch|Complete|\d{1,3}\s*-\s*\d{1,3})\b").unwrap()
+        Regex::new(r"(?i)\b(Batch|Complete|\d{1,3}\s*(?:-|~)\s*\d{1,3})\b").unwrap()
     });
-    if batch_re.is_match(&working) {
+    if batch_re.is_match(&working_no_season_prefix) {
         parsed.is_season_pack = true;
     }
 
@@ -498,6 +515,11 @@ struct JikanSearchResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct JikanSingleResponse {
+    data: JikanAnimeItem,
+}
+
+#[derive(Debug, Deserialize)]
 struct JikanAnimeItem {
     mal_id: u64,
     title: String,
@@ -622,6 +644,246 @@ impl JikanResolver {
 
         Ok(Some(meta))
     }
+
+    /// Resolves canonical MAL metadata for an exact MyAnimeList ID, checking SQLite cache first.
+    pub async fn resolve_mal_by_id(&self, mal_id: u64) -> Result<Option<MalMetadata>> {
+        let cache_key = format!("mal_id_{mal_id}");
+        let ttl = self.config.jikan.cache_ttl_days;
+        let db_clone = self.db.clone();
+        let key_clone = cache_key.clone();
+
+        if let Some(cached) =
+            tokio::task::spawn_blocking(move || db_clone.get_cached_mal(&key_clone, ttl)).await??
+        {
+            debug!(
+                mal_id = mal_id,
+                "Resolved MAL metadata by ID from SQLite cache"
+            );
+            return Ok(Some(cached));
+        }
+
+        if !self.config.jikan.enabled {
+            let meta = MalMetadata {
+                mal_id,
+                title: String::new(),
+                title_english: None,
+                title_japanese: None,
+                media_type: None,
+                episodes: None,
+                year: None,
+                synopsis: None,
+                image_url: None,
+            };
+            return Ok(Some(meta));
+        }
+
+        // Enforce polite delay before hitting Jikan API
+        self.config.polite_sleep().await;
+
+        let base = self.config.jikan.base_url.trim_end_matches('/');
+        let url = format!("{base}/anime/{mal_id}");
+
+        let resp = self.http.get(&url).send().await;
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!(status = %r.status(), mal_id = mal_id, "Jikan API returned non-success status for anime ID");
+                let meta = MalMetadata {
+                    mal_id,
+                    title: String::new(),
+                    title_english: None,
+                    title_japanese: None,
+                    media_type: None,
+                    episodes: None,
+                    year: None,
+                    synopsis: None,
+                    image_url: None,
+                };
+                return Ok(Some(meta));
+            }
+            Err(e) => {
+                warn!(error = %e, mal_id = mal_id, "Jikan API request failed for anime ID");
+                let meta = MalMetadata {
+                    mal_id,
+                    title: String::new(),
+                    title_english: None,
+                    title_japanese: None,
+                    media_type: None,
+                    episodes: None,
+                    year: None,
+                    synopsis: None,
+                    image_url: None,
+                };
+                return Ok(Some(meta));
+            }
+        };
+
+        let payload: JikanSingleResponse = match resp.json().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, mal_id = mal_id, "Failed to parse Jikan single anime JSON");
+                return Ok(None);
+            }
+        };
+
+        let item = payload.data;
+        let image_url = item
+            .images
+            .and_then(|i| i.jpg)
+            .and_then(|j| j.large_image_url.or(j.image_url));
+
+        let meta = MalMetadata {
+            mal_id: item.mal_id,
+            title: item.title,
+            title_english: item.title_english,
+            title_japanese: item.title_japanese,
+            media_type: item.media_type,
+            episodes: item.episodes,
+            year: item.year,
+            synopsis: item.synopsis,
+            image_url,
+        };
+
+        let db_save = self.db.clone();
+        let meta_save = meta.clone();
+        let key_save = cache_key.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || db_save.set_cached_mal(&key_save, &meta_save))
+                .await;
+
+        Ok(Some(meta))
+    }
+}
+
+/// Extracted links pointing to external anime databases (MAL, AniDB) and fansub information pages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalAnimeLinks {
+    pub mal_id: Option<u64>,
+    pub mal_url: Option<String>,
+    pub anidb_id: Option<u64>,
+    pub anidb_url: Option<String>,
+    pub information_url: Option<String>,
+}
+
+/// Parses HTML (e.g. from a Nyaa view page or fansub information page) to extract
+/// canonical MyAnimeList, AniDB, and Information links.
+pub fn parse_external_anime_links(html: &str) -> ExternalAnimeLinks {
+    let mut links = ExternalAnimeLinks::default();
+
+    // 1. Direct MAL URL: https://myanimelist.net/anime/<id>
+    static MAL_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let mal_re = MAL_URL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)https?://(?:www\.)?myanimelist\.net/anime/(\d+)"#).unwrap()
+    });
+    if let Some(caps) = mal_re.captures(html) {
+        if let Ok(id) = caps[1].parse::<u64>() {
+            links.mal_id = Some(id);
+            links.mal_url = Some(format!("https://myanimelist.net/anime/{id}"));
+        }
+    }
+
+    // 2. Direct AniDB URL: https://anidb.net/anime/<id> or https://anidb.net/a<id>
+    static ANIDB_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let anidb_re = ANIDB_URL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)https?://(?:www\.)?anidb\.net/(?:anime/|perl-bin/animedb\.pl\?show=anime&aid=|a)(\d+)"#).unwrap()
+    });
+    if let Some(caps) = anidb_re.captures(html) {
+        if let Ok(id) = caps[1].parse::<u64>() {
+            links.anidb_id = Some(id);
+            links.anidb_url = Some(format!("https://anidb.net/anime/{id}"));
+        }
+    }
+
+    // 3. Information Link on Nyaa:
+    // e.g. <div class="col-md-1">Information:</div>\s*<div class="col-md-5">\s*<a href="https://www.erai-raws.info/anime-list/...">
+    static NYAA_INFO_RE: OnceLock<Regex> = OnceLock::new();
+    let info_re = NYAA_INFO_RE.get_or_init(|| {
+        Regex::new(r#"(?i)Information:[\s\S]*?<a[^>]+href=["']?(https?://[^"'>\s]+)"#).unwrap()
+    });
+    if let Some(caps) = info_re.captures(html) {
+        let raw_url = caps[1].trim();
+        // Ignore self-referential nyaa links or generic search links
+        if !raw_url.contains("nyaa.si") {
+            links.information_url = Some(raw_url.to_string());
+        }
+    }
+
+    // Also check for fansub info links (like Erai-raws anime-list) in description / body
+    if links.information_url.is_none() {
+        static FANSUB_INFO_RE: OnceLock<Regex> = OnceLock::new();
+        let fansub_re = FANSUB_INFO_RE.get_or_init(|| {
+            Regex::new(r#"(?i)https?://(?:www\.)?erai-raws\.info/anime-list/[^"'\s\)]+"#).unwrap()
+        });
+        if let Some(caps) = fansub_re.captures(html) {
+            links.information_url = Some(caps[0].trim().to_string());
+        }
+    }
+
+    links
+}
+
+/// Asynchronously resolves external anime links (MAL ID/URL and AniDB ID/URL) starting from a release URL
+/// (e.g. Nyaa view page or fansub information page).
+pub async fn resolve_external_links_from_url(
+    http: &Client,
+    url: &str,
+) -> Result<ExternalAnimeLinks> {
+    let clean_url = url.trim();
+    if clean_url.is_empty() || !clean_url.starts_with("http") {
+        return Ok(ExternalAnimeLinks::default());
+    }
+
+    let resp = http
+        .get(clean_url)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(Duration::from_secs(12))
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            debug!(status = %r.status(), url = clean_url, "External URL returned non-success HTTP status");
+            return Ok(ExternalAnimeLinks::default());
+        }
+        Err(e) => {
+            debug!(error = %e, url = clean_url, "Failed fetching external URL");
+            return Ok(ExternalAnimeLinks::default());
+        }
+    };
+
+    let body = resp.text().await.unwrap_or_default();
+    let mut links = parse_external_anime_links(&body);
+
+    // If MAL ID wasn't found directly on the page, but an Information URL (e.g. Erai-raws anime-list) was found:
+    if links.mal_id.is_none() {
+        if let Some(info_url) = links.information_url.clone() {
+            debug!(info_url = %info_url, "Following Information link to extract MAL and AniDB links");
+            let sub_resp = http
+                .get(&info_url)
+                .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await;
+
+            if let Ok(sub_r) = sub_resp {
+                if sub_r.status().is_success() {
+                    let sub_body = sub_r.text().await.unwrap_or_default();
+                    let sub_links = parse_external_anime_links(&sub_body);
+                    if sub_links.mal_id.is_some() {
+                        links.mal_id = sub_links.mal_id;
+                        links.mal_url = sub_links.mal_url;
+                    }
+                    if sub_links.anidb_id.is_some() {
+                        links.anidb_id = sub_links.anidb_id;
+                        links.anidb_url = sub_links.anidb_url;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(links)
 }
 
 /// Formats a torrent release title strictly according to AnimeZ official naming standards:
@@ -637,6 +899,30 @@ impl JikanResolver {
 /// - Anime - Complete:
 ///   `[AniDB Main Title] (Year) [Fansub] [Additional Tags...]`
 ///
+/// Extracts the start and end episode from an episode range in a batch title (e.g. "02-07" -> (2, 7) or "01~12" -> (1, 12)).
+pub fn parse_batch_episode_range(title: &str) -> Option<(u32, u32)> {
+    // 1. Remove Season patterns like "Season 2 - " or "S02 - " or "2nd Season - " first
+    static SEASON_PREFIX_RE: OnceLock<Regex> = OnceLock::new();
+    let season_prefix_re = SEASON_PREFIX_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:Season\s*\d{1,2}|Part\s*\d{1,2}|Cour\s*\d{1,2}|Vol(?:ume)?\s*\d{1,2}|S\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season|(?:First|Second|Third|Fourth|Fifth|Sixth)\s*Season)\s*-\s*").unwrap()
+    });
+    let cleaned = season_prefix_re.replace_all(title, " ");
+
+    // 2. Search for episode range like "02-07" or "01~12"
+    static BATCH_RANGE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = BATCH_RANGE_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(\d{1,4})\s*(?:-|~)\s*(\d{1,4})\b").unwrap()
+    });
+    for caps in re.captures_iter(&cleaned) {
+        if let (Ok(start), Ok(end)) = (caps[1].parse::<u32>(), caps[2].parse::<u32>()) {
+            if start < end {
+                return Some((start, end));
+            }
+        }
+    }
+    None
+}
+
 /// Permitted Additional Tags (strictly enforced, in canonical order):
 ///   `[Dual Audio]`, `[Multi Audio]`, `[English Dubbed]`, `[RAW]`, `[HDR10]` / `[HDR10+]`, `[HEVC]`, `[10-bit]`
 pub fn format_animez_torrent_title(
@@ -695,14 +981,8 @@ pub fn format_animez_torrent_title(
     // 2. Format episode / batch portion
     let mut ep_part = String::new();
     if parsed.is_season_pack {
-        // Try extracting episode range like "01-12" from raw title
-        static EP_RANGE_RE: OnceLock<Regex> = OnceLock::new();
-        let ep_range_re = EP_RANGE_RE.get_or_init(|| {
-            Regex::new(r"(?i)\b(\d{1,4})\s*-\s*(\d{1,4})\b").unwrap()
-        });
-        if let Some(caps) = ep_range_re.captures(&parsed.raw_title) {
-            let start = caps[1].parse::<u32>().unwrap_or(1);
-            let end = caps[2].parse::<u32>().unwrap_or(start);
+        // Try extracting episode range like "01-12" or "02-07" from raw title
+        if let Some((start, end)) = parse_batch_episode_range(&parsed.raw_title) {
             if start < 100 && end < 100 {
                 ep_part = format!("- {:02}-{:02}", start, end);
             } else {
@@ -1002,5 +1282,66 @@ mod tests {
         let mut low_res = parse_anime_release("[Group] Title - 01 (360p).mkv");
         low_res.resolution = Some("360p".to_string());
         assert!(check_animez_rule_compliance(&low_res).is_err());
+    }
+
+    #[test]
+    fn test_batch_range_and_no_double_year() {
+        // Range parsing
+        assert_eq!(parse_batch_episode_range("[Erai-raws] Ao Ashi Season 2 - 02-07 [1080p]"), Some((2, 7)));
+        assert_eq!(parse_batch_episode_range("[Erai-raws] Ao Ashi Season 2 - 01-07 [1080p]"), Some((1, 7)));
+        assert_eq!(parse_batch_episode_range("Frieren 01~12 (Batch)"), Some((1, 12)));
+        assert_eq!(parse_batch_episode_range("[SubsPlease] Frieren - 05 (1080p).mkv"), None);
+
+        // Ensure Dia no Ace does not duplicate year (2026)
+        let p_dia = parse_anime_release(
+            "[Erai-raws] Diamond no Ace: Act II Second Season Part 2 - 06 [1080p CR WEB-DL AVC AAC][MultiSub][5C2E7EEF].mkv"
+        );
+        let title_dia = format_animez_torrent_title(
+            &p_dia,
+            None,
+            Some("Dia no Ace: Act II Second Season (2026)"),
+        );
+        assert_eq!(
+            title_dia,
+            "Dia no Ace: Act II Second Season (2026) - 06 [Erai-raws]"
+        );
+        assert_eq!(title_dia.matches("(2026)").count(), 1, "Year (2026) must not be duplicated");
+    }
+
+    #[test]
+    fn test_parse_external_anime_links() {
+        let nyaa_html = r#"
+            <div class="row">
+                <div class="col-md-1">Information:</div>
+                <div class="col-md-5">
+                    <a rel="noopener noreferrer nofollow" href="https://www.erai-raws.info/anime-list/kashita-maryoku-wa-revo-barai-de-kyousei-choushuu/">https://www.erai-raws.info/anime-list/kashita-maryoku-wa-revo-barai-de-kyousei-choushuu/</a>
+                </div>
+            </div>
+        "#;
+        let links = parse_external_anime_links(nyaa_html);
+        assert_eq!(
+            links.information_url.as_deref(),
+            Some("https://www.erai-raws.info/anime-list/kashita-maryoku-wa-revo-barai-de-kyousei-choushuu/")
+        );
+        assert_eq!(links.mal_id, None);
+
+        let erai_html = r#"
+            <div class=entry-sub-content-buttons>
+                <a class=entry-sub-content-buttons target=_blank href=https://myanimelist.net/anime/62922>MAL</a>
+                <a class=entry-sub-content-buttons target=_blank href=https://anidb.net/anime/19714>AniDB</a>
+            </div>
+        "#;
+        let erai_links = parse_external_anime_links(erai_html);
+        assert_eq!(erai_links.mal_id, Some(62922));
+        assert_eq!(erai_links.mal_url.as_deref(), Some("https://myanimelist.net/anime/62922"));
+        assert_eq!(erai_links.anidb_id, Some(19714));
+        assert_eq!(erai_links.anidb_url.as_deref(), Some("https://anidb.net/anime/19714"));
+
+        let direct_html = r#"
+            <p>Source link: <a href="https://myanimelist.net/anime/52991">Frieren on MAL</a></p>
+        "#;
+        let direct_links = parse_external_anime_links(direct_html);
+        assert_eq!(direct_links.mal_id, Some(52991));
+        assert_eq!(direct_links.mal_url.as_deref(), Some("https://myanimelist.net/anime/52991"));
     }
 }

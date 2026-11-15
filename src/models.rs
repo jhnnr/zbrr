@@ -82,6 +82,7 @@ pub struct DiscoveredRelease {
     pub seeders: u32,
     pub leechers: u32,
     pub publish_date: Option<DateTime<Utc>>,
+    pub info_url: Option<String>,
 }
 
 /// Structured metadata extracted from an anime release filename.
@@ -132,6 +133,7 @@ pub struct ReleaseRecord {
     pub indexer_name: String,
     pub download_url: Option<String>,
     pub magnet_url: Option<String>,
+    pub info_url: Option<String>,
     pub source_info_hash: Option<String>,
     pub tracker_info_hash: Option<String>,
     pub mal_id: Option<u64>,

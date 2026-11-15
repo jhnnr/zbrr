@@ -773,7 +773,20 @@ impl AnimezClient {
         target_season: Option<u32>,
         target_mal_id: Option<u64>,
     ) -> i32 {
-        // 1. Direct MAL ID match (+1000)
+        let titles_to_check = [
+            Some(&item.title),
+            item.title_romaji.as_ref(),
+            item.title_native.as_ref(),
+        ];
+
+        let target_s = target_season.unwrap_or(1);
+        let item_s = Self::extract_item_season(item);
+        let item_title_year = titles_to_check
+            .into_iter()
+            .flatten()
+            .find_map(|t| Self::extract_year_from_title(t));
+
+        // 1. Direct MAL ID match (+1000, only if seasons are strictly compatible)
         if let Some(target_mal) = target_mal_id {
             if let Some(ext) = &item.external_ids {
                 if let Some(mal_val) = &ext.mal {
@@ -783,6 +796,13 @@ impl AnimezClient {
                         _ => String::new(),
                     };
                     if mal_str == target_mal.to_string() {
+                        if let Some(is) = item_s {
+                            if is != target_s {
+                                return -999;
+                            }
+                        } else if target_s > 1 && item_title_year.is_none() {
+                            return -999;
+                        }
                         return 1000;
                     }
                 }
@@ -799,12 +819,6 @@ impl AnimezClient {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-
-        let titles_to_check = [
-            Some(&item.title),
-            item.title_romaji.as_ref(),
-            item.title_native.as_ref(),
-        ];
 
         let mut title_matched = false;
         let mut score = 0;
@@ -845,19 +859,12 @@ impl AnimezClient {
             return -999;
         }
 
-        let target_s = target_season.unwrap_or(1);
-        let item_s = Self::extract_item_season(item);
-        let item_title_year = titles_to_check
-            .into_iter()
-            .flatten()
-            .find_map(|t| Self::extract_year_from_title(t));
-
         if target_s > 1 {
             if let Some(is) = item_s {
                 if is == target_s {
                     score += 150;
                 } else {
-                    score -= 150;
+                    return -999;
                 }
             } else if item_title_year.is_some() {
                 // Item has a year in title (e.g. "Yasei no Last Boss ga Arawareta! (2026)")
@@ -865,7 +872,7 @@ impl AnimezClient {
                 score += 150;
             } else {
                 // Item has NO season suffix and NO year in title: it is Season 1!
-                score -= 150;
+                return -999;
             }
 
             if let Some(st) = &item.status {
@@ -888,7 +895,7 @@ impl AnimezClient {
             // Target is Season 1
             if let Some(is) = item_s {
                 if is > 1 {
-                    score -= 150;
+                    return -999;
                 } else {
                     score += 50;
                 }
@@ -897,7 +904,7 @@ impl AnimezClient {
                 if target_year == Some(ity) {
                     score += 100;
                 } else {
-                    score -= 150;
+                    return -999;
                 }
             } else {
                 // Clean base title with no season and no year is standard Season 1
@@ -1053,11 +1060,97 @@ impl AnimezClient {
             .map(|opt| opt.map(|(_, t)| t))
     }
 
-    /// Checks whether the user has any existing uploads for a given anime title on AnimeZ.
+    /// Imports or resolves an anime entry on AnimeZ using `POST https://animez.to/anime` with an external URL (e.g. MAL or AniDB link).
+    ///
+    /// Returns `Ok(Some((anime_id, canonical_title)))` if successfully resolved/imported by AnimeZ.
+    pub async fn import_or_resolve_anime(
+        &self,
+        external_url: &str,
+        csrf_token: &str,
+        referer: &str,
+    ) -> Result<Option<(u64, String)>> {
+        let clean_url = external_url.trim();
+        if clean_url.is_empty() || !clean_url.starts_with("http") {
+            return Ok(None);
+        }
+
+        self.config.polite_sleep().await;
+        let base = self.config.animez.base_url.trim_end_matches('/');
+        let url = format!("{base}/anime");
+
+        let mut headers = self.build_ajax_headers(Some(referer)).await?;
+        if let Ok(token_val) = HeaderValue::from_str(csrf_token) {
+            headers.insert(HeaderName::from_static("x-csrf-token"), token_val);
+        }
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let payload = serde_json::json!({
+            "url": clean_url
+        });
+
+        debug!(url = clean_url, "Importing/resolving anime entry on AnimeZ via external URL");
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .await?;
+
+        self.flaresolverr
+            .ingest_set_cookie_headers(resp.headers())
+            .await;
+
+        if !resp.status().is_success() {
+            debug!(
+                status = %resp.status(),
+                url = clean_url,
+                "AnimeZ /anime import endpoint returned non-success HTTP status"
+            );
+            return Ok(None);
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct AnimeImportResponse {
+            anime: Option<AnimeImportItem>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct AnimeImportItem {
+            id: u64,
+            title: String,
+        }
+
+        let body: AnimeImportResponse = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(error = %e, "Failed parsing AnimeZ /anime import JSON response");
+                return Ok(None);
+            }
+        };
+
+        if let Some(item) = body.anime {
+            info!(
+                anime_id = item.id,
+                title = %item.title,
+                url = clean_url,
+                "Successfully resolved/imported AnimeZ anime entry via external URL"
+            );
+            return Ok(Some((item.id, item.title)));
+        }
+
+        Ok(None)
+    }
+
+    /// Checks whether the user has any existing uploads for a given anime title and season on AnimeZ.
     pub async fn has_user_uploaded_prior_episode(
         &self,
         username: &str,
         anime_title: &str,
+        season: Option<u32>,
     ) -> Result<bool> {
         let trimmed_user = username.trim();
         if trimmed_user.is_empty() || trimmed_user.starts_with("REPLACE_") {
@@ -1081,9 +1174,15 @@ impl AnimezClient {
             return Ok(false);
         }
 
+        let target_s = season.unwrap_or(1);
         let norm_target = Self::normalize_title_for_lookup(anime_title);
         for entry in entries {
-            let norm_entry = Self::normalize_title_for_lookup(&entry.title);
+            let parsed_entry = crate::parser::parse_anime_release(&entry.title);
+            let entry_s = parsed_entry.season.unwrap_or(1);
+            if entry_s != target_s {
+                continue;
+            }
+            let norm_entry = Self::normalize_title_for_lookup(&parsed_entry.clean_title);
             if norm_entry.contains(&norm_target) || norm_target.contains(&norm_entry) {
                 return Ok(true);
             }
@@ -1283,6 +1382,36 @@ impl AnimezClient {
             .context("Failed to find Laravel CSRF `_token` on animez.to upload page")?;
         let post_url = Self::extract_upload_action_url(base, &upload_url, &upload_page_html);
 
+        // Attempt importing or resolving AnimeZ anime entry using MAL URL directly
+        let mut final_anime_id = anime_id;
+        let mut final_anime_title = animez_title.map(|s| s.to_string());
+
+        if let Some(m) = mal {
+            let mal_url = format!("https://myanimelist.net/anime/{}", m.mal_id);
+            match self.import_or_resolve_anime(&mal_url, &csrf_token, &upload_url).await {
+                Ok(Some((aid, title))) => {
+                    info!(
+                        anime_id = aid,
+                        title = %title,
+                        mal_id = m.mal_id,
+                        "Resolved AnimeZ anime entry via MAL URL import"
+                    );
+                    final_anime_id = Some(aid);
+                    final_anime_title = Some(title);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(error = %e, mal_id = m.mal_id, "Could not import anime via MAL URL; using search candidate");
+                }
+            }
+        }
+
+        let torrent_name = crate::parser::format_animez_torrent_title(
+            parsed,
+            mal,
+            final_anime_title.as_deref(),
+        );
+
         // Step 2: Prepare multipart form
         let torrent_bytes = fs::read(&bundle.torrent_path).with_context(|| {
             format!(
@@ -1336,7 +1465,7 @@ impl AnimezClient {
                 },
             );
 
-        if let Some(aid) = anime_id {
+        if let Some(aid) = final_anime_id {
             form = form.text("anime_id", aid.to_string());
         }
         if let Some(m) = mal {
@@ -1515,13 +1644,22 @@ impl AnimezClient {
             }
 
             // Resolve AnimeZ internal anime entry (ID and canonical title)
-            let (pub_anime_id, pub_anime_title) = if let (Some(aid), Some(atitle)) = (anime_id, animez_title) {
-                (aid, atitle.to_string())
+            let (pub_anime_id, pub_anime_title) = if let (Some(aid), Some(atitle)) = (final_anime_id, &final_anime_title) {
+                (aid, atitle.clone())
             } else {
-                match self
-                    .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
-                    .await?
-                {
+                let mut resolved = None;
+                if let Some(m) = mal {
+                    let mal_url = format!("https://myanimelist.net/anime/{}", m.mal_id);
+                    if let Ok(Some(entry)) = self.import_or_resolve_anime(&mal_url, &edit_csrf_token, &final_url).await {
+                        resolved = Some(entry);
+                    }
+                }
+                if resolved.is_none() {
+                    resolved = self
+                        .lookup_anime_entry(&parsed.clean_title, parsed.year, parsed.season, mal.map(|m| m.mal_id))
+                        .await?;
+                }
+                match resolved {
                     Some(entry) => entry,
                     None => {
                         anyhow::bail!(
@@ -2128,6 +2266,7 @@ mod tests {
             "Season 2 item must outscore Season 1 item when target_season is 2 (got S2={score_s2_for_s2}, S1={score_s1_for_s2})"
         );
         assert!(score_s2_for_s2 > 0);
+        assert_eq!(score_s1_for_s2, -999, "Season 1 item must be completely disqualified for Season 2 target");
 
         // Looking for Season 1: S1 must beat S2 decisively
         let score_s1_for_s1 = AnimezClient::score_anime_candidate(
@@ -2149,5 +2288,6 @@ mod tests {
             "Season 1 item must outscore Season 2 item when target_season is 1 (got S1={score_s1_for_s1}, S2={score_s2_for_s1})"
         );
         assert!(score_s1_for_s1 > 0);
+        assert_eq!(score_s2_for_s1, -999, "Season 2 item must be completely disqualified for Season 1 target");
     }
 }

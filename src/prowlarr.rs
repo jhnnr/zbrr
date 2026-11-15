@@ -31,6 +31,12 @@ struct ProwlarrApiSearchItem {
     seeders: Option<u32>,
     leechers: Option<u32>,
     publish_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    info_url: Option<String>,
+    #[serde(default)]
+    comment_url: Option<String>,
+    #[serde(default)]
+    comments_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -372,6 +378,17 @@ impl ProwlarrClient {
             }
 
             let guid = item.guid.unwrap_or_else(|| title.clone());
+            let info_url = item
+                .info_url
+                .or(item.comment_url)
+                .or(item.comments_url)
+                .or_else(|| {
+                    if guid.starts_with("http") {
+                        Some(guid.clone())
+                    } else {
+                        None
+                    }
+                });
             results.push(DiscoveredRelease {
                 guid,
                 title,
@@ -384,6 +401,7 @@ impl ProwlarrClient {
                 seeders: item.seeders.unwrap_or(0),
                 leechers: item.leechers.unwrap_or(0),
                 publish_date: item.publish_date,
+                info_url,
             });
         }
 
@@ -477,8 +495,20 @@ impl ProwlarrClient {
             .into_iter()
             .filter_map(|i| {
                 let title = i.title?;
+                let guid = i.guid.unwrap_or_else(|| title.clone());
+                let info_url = i
+                    .info_url
+                    .or(i.comment_url)
+                    .or(i.comments_url)
+                    .or_else(|| {
+                        if guid.starts_with("http") {
+                            Some(guid.clone())
+                        } else {
+                            None
+                        }
+                    });
                 Some(DiscoveredRelease {
-                    guid: i.guid.unwrap_or_else(|| title.clone()),
+                    guid,
                     title,
                     indexer_id: i.indexer_id.unwrap_or(indexer_id),
                     indexer_name: i.indexer.unwrap_or_else(|| "AnimeZ".to_string()),
@@ -489,6 +519,7 @@ impl ProwlarrClient {
                     seeders: i.seeders.unwrap_or(0),
                     leechers: i.leechers.unwrap_or(0),
                     publish_date: i.publish_date,
+                    info_url,
                 })
             })
             .collect())
@@ -563,6 +594,17 @@ impl ProwlarrClient {
             for i in items {
                 let Some(title) = i.title else { continue };
                 let guid = i.guid.unwrap_or_else(|| title.clone());
+                let info_url = i
+                    .info_url
+                    .or(i.comment_url)
+                    .or(i.comments_url)
+                    .or_else(|| {
+                        if guid.starts_with("http") {
+                            Some(guid.clone())
+                        } else {
+                            None
+                        }
+                    });
                 if seen_guids.insert(guid.clone()) {
                     candidates.push(DiscoveredRelease {
                         guid,
@@ -576,6 +618,7 @@ impl ProwlarrClient {
                         seeders: i.seeders.unwrap_or(0),
                         leechers: i.leechers.unwrap_or(0),
                         publish_date: i.publish_date,
+                        info_url,
                     });
                 }
             }
@@ -587,6 +630,65 @@ impl ProwlarrClient {
         }
 
         Ok(candidates)
+    }
+
+    /// Searches configured Prowlarr source indexers for a specific query string.
+    pub async fn search_source_indexers(&self, query: &str) -> Result<Vec<DiscoveredRelease>> {
+        let base = self.config.prowlarr.url.trim_end_matches('/');
+        let url = format!("{base}/api/v1/search");
+        let source_ids = self.resolve_source_indexer_ids().await?;
+
+        self.config.polite_sleep().await;
+        let mut req = self
+            .http
+            .get(&url)
+            .header("X-Api-Key", &self.config.prowlarr.api_key)
+            .query(&[("query", query), ("type", "search")]);
+
+        for id in &source_ids {
+            req = req.query(&[("indexerIds", &id.to_string())]);
+        }
+        for cat in &self.config.prowlarr.categories {
+            req = req.query(&[("categories", &cat.to_string())]);
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Prowlarr search returned HTTP {}", resp.status());
+        }
+
+        let items: Vec<ProwlarrApiSearchItem> = resp.json().await.unwrap_or_default();
+        let mut results = Vec::with_capacity(items.len());
+        for i in items {
+            let Some(title) = i.title else { continue };
+            let guid = i.guid.unwrap_or_else(|| title.clone());
+            let info_url = i
+                .info_url
+                .or(i.comment_url)
+                .or(i.comments_url)
+                .or_else(|| {
+                    if guid.starts_with("http") {
+                        Some(guid.clone())
+                    } else {
+                        None
+                    }
+                });
+            results.push(DiscoveredRelease {
+                guid,
+                title,
+                indexer_id: i.indexer_id.unwrap_or(0),
+                indexer_name: i.indexer.unwrap_or_default(),
+                download_url: i.download_url,
+                magnet_url: i.magnet_url,
+                info_hash: i.info_hash,
+                size_bytes: i.size.unwrap_or(0),
+                seeders: i.seeders.unwrap_or(0),
+                leechers: i.leechers.unwrap_or(0),
+                publish_date: i.publish_date,
+                info_url,
+            });
+        }
+        Ok(results)
     }
 
     /// Evaluates configured filter rules (include/exclude regex, group whitelist, resolution, seeders, size).
@@ -730,6 +832,7 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
     let mut title = String::new();
     let mut guid = String::new();
     let mut link = String::new();
+    let mut comments = String::new();
     let mut size_bytes: u64 = 0;
     let mut seeders: u32 = 0;
     let mut leechers: u32 = 0;
@@ -745,6 +848,7 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                     title.clear();
                     guid.clear();
                     link.clear();
+                    comments.clear();
                     size_bytes = 0;
                     seeders = 0;
                     leechers = 0;
@@ -789,6 +893,7 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                     "title" => title = txt,
                     "guid" => guid = txt,
                     "link" => link = txt,
+                    "comments" => comments = txt,
                     "size" => size_bytes = txt.parse().unwrap_or(size_bytes),
                     _ => {}
                 }
@@ -811,6 +916,14 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                             (None, magnet_url.clone())
                         };
 
+                        let info_url = if guid.starts_with("http") {
+                            Some(guid.clone())
+                        } else if !comments.is_empty() && comments.starts_with("http") {
+                            Some(comments.clone())
+                        } else {
+                            None
+                        };
+
                         releases.push(DiscoveredRelease {
                             guid: final_guid,
                             title: title.clone(),
@@ -823,6 +936,7 @@ pub fn parse_torznab_xml(xml: &str, default_indexer_id: i64) -> Result<Vec<Disco
                             seeders,
                             leechers,
                             publish_date: None,
+                            info_url,
                         });
                     }
                 }

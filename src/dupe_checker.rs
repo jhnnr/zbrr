@@ -4,6 +4,7 @@ use crate::db::Database;
 use crate::models::{DupeCheckResult, ParsedRelease};
 use crate::parser::parse_anime_release;
 use crate::prowlarr::ProwlarrClient;
+use crate::qbittorrent::QbittorrentClient;
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
@@ -11,14 +12,21 @@ pub struct DupeChecker {
     config: AppConfig,
     prowlarr: ProwlarrClient,
     animez: AnimezClient,
+    qbit: QbittorrentClient,
 }
 
 impl DupeChecker {
-    pub fn new(config: AppConfig, prowlarr: ProwlarrClient, animez: AnimezClient) -> Self {
+    pub fn new(
+        config: AppConfig,
+        prowlarr: ProwlarrClient,
+        animez: AnimezClient,
+        qbit: QbittorrentClient,
+    ) -> Self {
         Self {
             config,
             prowlarr,
             animez,
+            qbit,
         }
     }
 
@@ -128,21 +136,71 @@ impl DupeChecker {
             return Ok(None);
         }
 
-        // Batches and movie/specials are permitted without ongoing sequence checks
+        // 1. Check if this is a batch/pack
         if parsed.is_season_pack {
-            return Ok(None);
+            // Check if there is an episode range in the title (e.g. "01-07" or "02-07")
+            if let Some((start, end)) = crate::parser::parse_batch_episode_range(&parsed.raw_title) {
+                if start <= 1 {
+                    // Batch starts from Episode 01 (e.g. 01-07 or 01~12)
+                    // This satisfies the catch-up batch requirement under AnimeZ Section 3
+                    info!(
+                        title = %parsed.raw_title,
+                        range = %format!("{start:02}-{end:02}"),
+                        "Batch starts at episode 01; valid catch-up batch satisfying ongoing rule"
+                    );
+                    return Ok(None);
+                }
+                // Batch starts at episode > 1 (e.g. 02-07)!
+                // A mid-season batch cannot bypass catch-up unless prior sequence is already established!
+            } else if parsed.episode.is_none() || parsed.episode.unwrap_or(0) <= 1 {
+                // Complete season pack or movie without mid-season episode numbering
+                return Ok(None);
+            }
         }
 
-        let Some(ep) = parsed.episode else {
-            return Ok(None);
+        let ep = match parsed.episode {
+            Some(e) => e,
+            None => {
+                if !parsed.is_season_pack {
+                    return Ok(None);
+                }
+                // Batch with unknown episode range starting mid-season
+                2
+            }
         };
 
-        // Episode 1 (or 0) starts a sequence, always permitted
-        if ep <= 1 {
+        // Episode 1 (or 0) starts a sequence, always permitted for single episodes
+        if ep <= 1 && !parsed.is_season_pack {
             return Ok(None);
         }
 
-        // 1. Check local SQLite DB for prior SEEDING uploads for this anime
+        let target_season = parsed.season.unwrap_or(1);
+
+        // 2. Check currently seeding torrents in qBittorrent (animez-seeding)
+        // If the user is actively seeding this anime + season on AnimeZ, ongoing sequence is verified!
+        if let Ok(seeding_torrents) = self.qbit.list_torrents(Some(&self.config.qbittorrent.seeding_category)).await {
+            let norm_target = crate::parser::normalize_title(&parsed.clean_title);
+            for st in seeding_torrents {
+                let st_parsed = parse_anime_release(&st.name);
+                let st_season = st_parsed.season.unwrap_or(1);
+                if st_season != target_season {
+                    continue;
+                }
+                let norm_st = crate::parser::normalize_title(&st_parsed.clean_title);
+                if norm_st == norm_target || norm_st.starts_with(&norm_target) || norm_target.starts_with(&norm_st) {
+                    info!(
+                        title = %parsed.clean_title,
+                        season = target_season,
+                        episode = ?parsed.episode,
+                        seeding_torrent = %st.name,
+                        "Found active seeding torrent in animez-seeding category; ongoing sequence verified"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        // 3. Check local SQLite DB for prior SEEDING uploads for this anime + season
         let db_clone = db.clone();
         let clean_title = parsed.clean_title.clone();
         let season = parsed.season;
@@ -154,23 +212,25 @@ impl DupeChecker {
         if has_local_prior {
             debug!(
                 title = %parsed.clean_title,
+                season = target_season,
                 episode = ep,
                 "Prior local seeding upload found for anime; ongoing sequence satisfied"
             );
             return Ok(None);
         }
 
-        // 2. Check AnimeZ tracker profile uploads
+        // 4. Check AnimeZ tracker profile uploads (with season isolation)
         let username = self.config.animez.username.trim();
         if !username.is_empty() && !username.starts_with("REPLACE_") && !username.starts_with("your_") {
             match self
                 .animez
-                .has_user_uploaded_prior_episode(username, &parsed.clean_title)
+                .has_user_uploaded_prior_episode(username, &parsed.clean_title, parsed.season)
                 .await
             {
                 Ok(true) => {
                     info!(
                         title = %parsed.clean_title,
+                        season = target_season,
                         episode = ep,
                         uploader = username,
                         "Prior upload found on AnimeZ tracker profile; ongoing sequence satisfied"
@@ -188,9 +248,19 @@ impl DupeChecker {
             }
         }
 
-        let reason = format!(
-            "AnimeZ upload rules (Section 3) catch-up violation: episode {ep} > 1 cannot be uploaded mid-season without prior sequence (episodes 01~{ep}); upload a catch-up batch of all available episodes first"
-        );
+        let reason = if parsed.is_season_pack {
+            if let Some((start, end)) = crate::parser::parse_batch_episode_range(&parsed.raw_title) {
+                format!(
+                    "AnimeZ upload rules (Section 3) catch-up violation: batch starts at episode {start} > 1 without prior sequence (episodes 01~{end}); catch-up batch must start from episode 01"
+                )
+            } else {
+                "AnimeZ upload rules (Section 3) catch-up violation: mid-season batch without prior sequence; upload a catch-up batch of all available episodes starting from episode 01".to_string()
+            }
+        } else {
+            format!(
+                "AnimeZ upload rules (Section 3) catch-up violation: episode {ep} > 1 cannot be uploaded mid-season without prior sequence (episodes 01~{ep}); upload a catch-up batch of all available episodes first"
+            )
+        };
         Ok(Some(reason))
     }
 
@@ -360,17 +430,29 @@ mod tests {
         let flaresolverr = crate::flaresolverr::FlareSolverrClient::new(config.clone())?;
         let animez = AnimezClient::new(config.clone(), flaresolverr)?;
         let prowlarr = ProwlarrClient::new(config.clone())?;
-        let checker = DupeChecker::new(config, prowlarr, animez);
+        let qbit = QbittorrentClient::new(config.clone())?;
+        let checker = DupeChecker::new(config, prowlarr, animez, qbit);
 
         // Episode 1 is always allowed
         let ep1 = parse_anime_release("[SubsPlease] Frieren - 01 (1080p).mkv");
         let res1 = checker.check_ongoing_catchup_rule(&ep1, Some(100), &db).await?;
         assert!(res1.is_none(), "Episode 1 should always be allowed");
 
-        // Batches are always allowed
-        let batch = parse_anime_release("[SubsPlease] Frieren - 01-06 (1080p) (Batch).mkv");
-        let res_batch = checker.check_ongoing_catchup_rule(&batch, Some(100), &db).await?;
-        assert!(res_batch.is_none(), "Batches should always be allowed");
+        // Batches starting at 01 are allowed (valid catch-up batch)
+        let batch_01_06 = parse_anime_release("[SubsPlease] Frieren - 01-06 (1080p) (Batch).mkv");
+        let res_batch_01 = checker.check_ongoing_catchup_rule(&batch_01_06, Some(100), &db).await?;
+        assert!(res_batch_01.is_none(), "Batch starting at episode 01 must be allowed");
+
+        // Batches starting at episode > 1 (e.g. 02-07) are NOT allowed without prior sequence!
+        let bad_batch = parse_anime_release("[Erai-raws] Ao Ashi Season 2 - 02-07 [1080p CR WEB-DL AVC AAC][MultiSub][68D14CA1].mkv");
+        let res_bad_batch = checker.check_ongoing_catchup_rule(&bad_batch, Some(200), &db).await?;
+        assert!(res_bad_batch.is_some(), "Batch starting at episode 2 without prior sequence must be skipped");
+        assert!(res_bad_batch.unwrap().contains("batch starts at episode 2 > 1"));
+
+        // Batch of the same series starting at episode 01 IS allowed
+        let good_batch = parse_anime_release("[Erai-raws] Ao Ashi Season 2 - 01-07 [1080p CR WEB-DL AVC AAC][MultiSub][68D14CA1].mkv");
+        let res_good_batch = checker.check_ongoing_catchup_rule(&good_batch, Some(200), &db).await?;
+        assert!(res_good_batch.is_none(), "Batch starting at episode 01 must be allowed as a catch-up batch");
 
         // Episode 7 without prior sequence is rejected by catch-up rule
         let ep7 = parse_anime_release("[SubsPlease] Frieren - 07 (1080p).mkv");
@@ -378,7 +460,7 @@ mod tests {
         assert!(res7.is_some(), "Episode 7 without prior sequence must be skipped");
         assert!(res7.unwrap().contains("catch-up violation"));
 
-        // Insert Ep 1 as SEEDING in DB
+        // Insert Ep 1 (Season 1) as SEEDING in DB
         let disc = crate::models::DiscoveredRelease {
             guid: "ep1-guid".to_string(),
             title: ep1.raw_title.clone(),
@@ -391,14 +473,21 @@ mod tests {
             seeders: 10,
             leechers: 0,
             publish_date: None,
+            info_url: None,
         };
         let id = db.insert_discovered(&disc, &ep1)?;
         db.set_dupe_checked(id, Some(100))?;
         db.set_seeding(id, Some("https://animez.to/torrents/100"))?;
 
-        // Now Episode 7 is allowed because the uploader established prior sequence in DB
+        // Now Season 1 Episode 7 is allowed because the uploader established prior sequence in DB
         let res7_after = checker.check_ongoing_catchup_rule(&ep7, Some(100), &db).await?;
-        assert!(res7_after.is_none(), "Episode 7 must be allowed once prior sequence is in DB");
+        assert!(res7_after.is_none(), "Season 1 Episode 7 must be allowed once prior sequence is in DB");
+
+        // BUT Season 2 Episode 7 must STILL BE REJECTED because Season 1 does NOT satisfy Season 2!
+        let s2_ep7 = parse_anime_release("[SubsPlease] Frieren Season 2 - 07 (1080p).mkv");
+        let res_s2_ep7 = checker.check_ongoing_catchup_rule(&s2_ep7, Some(100), &db).await?;
+        assert!(res_s2_ep7.is_some(), "Season 2 Episode 7 must be rejected even if Season 1 was seeded");
+        assert!(res_s2_ep7.unwrap().contains("catch-up violation"));
 
         Ok(())
     }

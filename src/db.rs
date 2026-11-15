@@ -47,6 +47,7 @@ impl Database {
                 indexer_name TEXT NOT NULL,
                 download_url TEXT,
                 magnet_url TEXT,
+                info_url TEXT,
                 source_info_hash TEXT,
                 tracker_info_hash TEXT,
                 mal_id INTEGER,
@@ -77,6 +78,10 @@ impl Database {
             );
             "#,
         )?;
+
+        // Ensure info_url column exists for existing databases
+        let _ = conn.execute("ALTER TABLE releases ADD COLUMN info_url TEXT", []);
+
         Ok(())
     }
 
@@ -145,10 +150,10 @@ impl Database {
             r#"
             INSERT INTO releases (
                 guid, raw_title, normalized_key, parsed_json,
-                indexer_id, indexer_name, download_url, magnet_url,
+                indexer_id, indexer_name, download_url, magnet_url, info_url,
                 source_info_hash, size_bytes, seeders, state,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
             params![
                 item.guid,
@@ -159,6 +164,7 @@ impl Database {
                 item.indexer_name,
                 item.download_url,
                 item.magnet_url,
+                item.info_url,
                 item.info_hash,
                 item.size_bytes as i64,
                 item.seeders,
@@ -393,6 +399,117 @@ impl Database {
         }
     }
 
+    pub fn get_release_by_source_hash(&self, hash: &str) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT * FROM releases WHERE LOWER(source_info_hash) = LOWER(?1) LIMIT 1")?;
+        let mut rows = stmt.query_map(params![hash.trim()], Self::map_row)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_release_by_title(&self, title: &str) -> Result<Option<ReleaseRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT * FROM releases WHERE raw_title = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![title.trim()], Self::map_row)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn adopt_staging_torrent(
+        &self,
+        name: &str,
+        hash: &str,
+        size_bytes: u64,
+        save_path: &str,
+        content_path: Option<&str>,
+        is_completed: bool,
+    ) -> Result<ReleaseRecord> {
+        let parsed = crate::parser::parse_anime_release(name);
+        let parsed_json = serde_json::to_string(&parsed)?;
+        let guid = format!("adopted-qbit-{}", hash.to_ascii_lowercase());
+        let now = Utc::now().to_rfc3339();
+        let initial_state = if is_completed {
+            ReleaseState::Packaging
+        } else {
+            ReleaseState::Downloading
+        };
+
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO releases (
+                guid, raw_title, normalized_key, parsed_json,
+                indexer_id, indexer_name, download_url, magnet_url, info_url,
+                source_info_hash, size_bytes, seeders, state,
+                save_path, content_path,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "#,
+            params![
+                guid,
+                name,
+                parsed.normalized_key,
+                parsed_json,
+                0,
+                "qBittorrent-Staging",
+                None::<String>,
+                None::<String>,
+                None::<String>,
+                hash.to_ascii_lowercase(),
+                size_bytes as i64,
+                0,
+                initial_state.as_str(),
+                save_path,
+                content_path,
+                now,
+                now,
+            ],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        self.get_release_by_id(id)?
+            .with_context(|| format!("Failed to retrieve adopted release ID {id}"))
+    }
+
+    pub fn update_staging_status(
+        &self,
+        id: i64,
+        source_info_hash: &str,
+        save_path: &str,
+        content_path: &str,
+        new_state: ReleaseState,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            UPDATE releases
+            SET source_info_hash = ?1,
+                save_path = CASE WHEN ?2 != '' THEN ?2 ELSE save_path END,
+                content_path = CASE WHEN ?3 != '' THEN ?3 ELSE content_path END,
+                state = ?4,
+                error_message = NULL,
+                updated_at = ?5
+            WHERE id = ?6
+            "#,
+            params![
+                source_info_hash.to_ascii_lowercase(),
+                save_path,
+                content_path,
+                new_state.as_str(),
+                now,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Resets a FAILED or SKIPPED release back to the appropriate stage for retrying.
     pub fn reset_for_retry(&self, id: i64) -> Result<ReleaseState> {
         let rec = self
@@ -472,36 +589,52 @@ impl Database {
             .collect::<Vec<_>>()
             .join("_");
 
-        let s = season.unwrap_or(1);
-        let season_token = format!("|s{s:02}");
+        let target_season = season.unwrap_or(1);
+        let season_token = format!("|s{target_season:02}");
 
-        // 1. Check by MAL ID if available
+        // 1. Check by MAL ID if available, but strictly verify that it matches target_season
         if let Some(mid) = mal_id {
-            let by_mal: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM releases WHERE state = 'SEEDING' AND mal_id = ?1 LIMIT 1",
-                    params![mid as i64],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if by_mal.is_some() {
-                return Ok(true);
+            let mut stmt = conn.prepare(
+                "SELECT normalized_key, parsed_json FROM releases WHERE state = 'SEEDING' AND mal_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![mid as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (key, parsed_json) = row?;
+                if key.contains(&season_token) {
+                    return Ok(true);
+                }
+                if let Some(pj) = parsed_json {
+                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&pj) {
+                        if parsed.season.unwrap_or(1) == target_season {
+                            return Ok(true);
+                        }
+                    }
+                }
             }
         }
 
         // 2. Check by normalized title & season in normalized_key
         if !norm_prefix.is_empty() {
             let mut stmt = conn.prepare(
-                "SELECT id, normalized_key FROM releases WHERE state = 'SEEDING' AND normalized_key LIKE ?1 LIMIT 10",
+                "SELECT normalized_key, parsed_json FROM releases WHERE state = 'SEEDING' AND normalized_key LIKE ?1 LIMIT 20",
             )?;
             let like_pat = format!("{norm_prefix}%");
             let rows = stmt.query_map(params![like_pat], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
             })?;
             for row in rows {
-                let (_, key) = row?;
-                if key.contains(&season_token) || key.starts_with(&norm_prefix) {
+                let (key, parsed_json) = row?;
+                if key.contains(&season_token) {
                     return Ok(true);
+                }
+                if let Some(pj) = parsed_json {
+                    if let Ok(parsed) = serde_json::from_str::<ParsedRelease>(&pj) {
+                        if parsed.season.unwrap_or(1) == target_season {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
         }
@@ -514,9 +647,12 @@ impl Database {
         &self,
         clean_title: &str,
         mal_id: Option<u64>,
+        season: Option<u32>,
     ) -> Result<usize> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
+        let target_season = season.unwrap_or(1);
+        let season_token = format!("|s{target_season:02}");
 
         let norm_prefix: String = clean_title
             .to_ascii_lowercase()
@@ -529,7 +665,7 @@ impl Database {
 
         let mut total_unskipped = 0;
 
-        // 1. Un-skip by MAL ID if present
+        // 1. Un-skip by MAL ID if present (matching season token in normalized_key)
         if let Some(mid) = mal_id {
             let count = conn.execute(
                 r#"
@@ -540,15 +676,16 @@ impl Database {
                 WHERE state = 'SKIPPED'
                   AND error_message LIKE '%catch-up%'
                   AND mal_id = ?2
+                  AND normalized_key LIKE ?3
                 "#,
-                params![now, mid as i64],
+                params![now, mid as i64, format!("%{season_token}%")],
             )?;
             total_unskipped += count;
         }
 
-        // 2. Un-skip by normalized title prefix if present
+        // 2. Un-skip by normalized title prefix & season token
         if !norm_prefix.is_empty() {
-            let like_pat = format!("{norm_prefix}%");
+            let like_pat = format!("{norm_prefix}%{season_token}%");
             let count = conn.execute(
                 r#"
                 UPDATE releases
@@ -739,6 +876,7 @@ impl Database {
             indexer_name: row.get("indexer_name")?,
             download_url: row.get("download_url")?,
             magnet_url: row.get("magnet_url")?,
+            info_url: row.get("info_url").unwrap_or(None),
             source_info_hash: row.get("source_info_hash")?,
             tracker_info_hash: row.get("tracker_info_hash")?,
             mal_id: mal_id_opt.map(|v| v as u64),
@@ -781,6 +919,7 @@ mod tests {
             seeders: 42,
             leechers: 3,
             publish_date: Some(Utc::now()),
+            info_url: Some("https://nyaa.si/view/123456".to_string()),
         };
 
         let parsed = ParsedRelease {
@@ -809,6 +948,7 @@ mod tests {
         let rec = db.get_release_by_id(id)?.unwrap();
         assert_eq!(rec.state, ReleaseState::DupeChecked);
         assert_eq!(rec.mal_id, Some(52991));
+        assert_eq!(rec.info_url.as_deref(), Some("https://nyaa.si/view/123456"));
 
         db.mark_failed(id, "network timeout")?;
         let rec = db.get_release_by_id(id)?.unwrap();
@@ -835,6 +975,7 @@ mod tests {
             seeders: 50,
             leechers: 2,
             publish_date: Some(Utc::now()),
+            info_url: Some("https://nyaa.si/view/123458".to_string()),
         };
         let parsed3 = ParsedRelease {
             raw_title: disc3.title.clone(),
@@ -852,11 +993,16 @@ mod tests {
         let rec3 = db.get_release_by_id(id3)?.unwrap();
         assert_eq!(rec3.state, ReleaseState::Skipped);
 
-        let unskipped = db.unskip_catchup_releases_for_anime("Frieren", Some(52991))?;
+        let unskipped = db.unskip_catchup_releases_for_anime("Frieren", Some(52991), Some(1))?;
         assert_eq!(unskipped, 1);
         let rec3_unskipped = db.get_release_by_id(id3)?.unwrap();
         assert_eq!(rec3_unskipped.state, ReleaseState::Discovered);
         assert!(rec3_unskipped.error_message.is_none());
+
+        // Season isolation: Season 1 is SEEDING (id2), so Season 1 has prior upload:
+        assert!(db.has_prior_upload_for_anime("Frieren", Some(52991), Some(1))?);
+        // But Season 2 does NOT have prior upload!
+        assert!(!db.has_prior_upload_for_anime("Frieren", Some(52991), Some(2))?);
 
         // Test finding earliest actionable release for anime
         let earliest = db.find_earliest_actionable_release_for_anime("Frieren", Some(52991))?;

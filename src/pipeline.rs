@@ -9,13 +9,26 @@ use crate::parser::{parse_anime_release, JikanResolver};
 use crate::prowlarr::ProwlarrClient;
 use crate::qbittorrent::QbittorrentClient;
 use anyhow::{Context, Result};
+use reqwest::Client;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Represents an anime series currently actively seeding in qBittorrent under `animez-seeding`.
+#[derive(Debug, Clone)]
+pub struct ActiveSeedingSeries {
+    pub clean_title: String,
+    pub season: u32,
+    pub release_group: Option<String>,
+    pub resolution: Option<String>,
+    pub video_codec: Option<String>,
+    pub max_episode: u32,
+}
+
 pub struct Pipeline {
     config: AppConfig,
+    http: Client,
     db: Database,
     prowlarr: ProwlarrClient,
     jikan: JikanResolver,
@@ -28,21 +41,28 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(config: AppConfig) -> Result<Self> {
+        let http = Client::builder()
+            .user_agent("zbrr/0.1.0")
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Failed to build Pipeline HTTP client")?;
         let db = Database::open(config.db_path())?;
         let prowlarr = ProwlarrClient::new(config.clone())?;
         let jikan = JikanResolver::new(config.clone(), db.clone())?;
         let flaresolverr = FlareSolverrClient::new(config.clone())?;
         let animez = AnimezClient::new(config.clone(), flaresolverr.clone())?;
+        let qbit = QbittorrentClient::new(config.clone())?;
         let dupe_checker = DupeChecker::new(
             config.clone(),
             ProwlarrClient::new(config.clone())?,
             animez.clone(),
+            qbit.clone(),
         );
-        let qbit = QbittorrentClient::new(config.clone())?;
         let packager = Packager::new(config.clone());
 
         Ok(Self {
             config,
+            http,
             db,
             prowlarr,
             jikan,
@@ -104,8 +124,126 @@ impl Pipeline {
     pub async fn run_cycle(&self, dry_run: bool) -> Result<()> {
         let effective_dry_run = dry_run || self.config.general.dry_run;
         info!(dry_run = effective_dry_run, "Starting pipeline poll cycle");
+        let limit = self.config.general.max_per_cycle.max(1);
 
+        // ---------------------------------------------------------------------
+        // Stage 0: Priority Check — Existing Torrents in animez-staging
+        // The FIRST thing to check: if there is an existing torrent in animez-staging,
+        // prioritize processing that before discovering new releases.
+        // ---------------------------------------------------------------------
+        let staging_category = &self.config.qbittorrent.staging_category;
+        let mut processed_staging_count = 0;
+
+        match self.qbit.list_torrents(Some(staging_category)).await {
+            Ok(staging_torrents) if !staging_torrents.is_empty() => {
+                info!(
+                    count = staging_torrents.len(),
+                    category = %staging_category,
+                    "Found existing torrent(s) in staging category; prioritizing processing before new discovery"
+                );
+
+                // Sort: Completed torrents (100% downloaded) first, then active downloading torrents
+                let mut sorted = staging_torrents;
+                sorted.sort_by_key(|t| if t.is_completed() { 0 } else { 1 });
+
+                for qbit_item in sorted {
+                    let rec_res = self.resolve_or_adopt_staging_torrent(&qbit_item).await;
+                    match rec_res {
+                        Ok(rec) => {
+                            if rec.state == ReleaseState::Seeding {
+                                debug!(
+                                    id = rec.id,
+                                    title = %rec.raw_title,
+                                    "Staging torrent already marked SEEDING in SQLite; skipping"
+                                );
+                                continue;
+                            }
+
+                            info!(
+                                id = rec.id,
+                                title = %rec.raw_title,
+                                hash = %qbit_item.hash,
+                                progress = qbit_item.progress,
+                                completed = qbit_item.is_completed(),
+                                state = %rec.state,
+                                "Prioritizing existing staging torrent from qBittorrent"
+                            );
+
+                            let id = rec.id;
+                            let title = rec.raw_title.clone();
+                            if let Err(e) = self.advance_release(rec, effective_dry_run).await {
+                                let err_msg = format!("{e:#}");
+                                error!(
+                                    release_id = id,
+                                    title = %title,
+                                    error = %err_msg,
+                                    "Staging release failed during pipeline execution; marking FAILED in SQLite"
+                                );
+                                let db_err = self.db.clone();
+                                let _ = tokio::task::spawn_blocking(move || db_err.mark_failed(id, &err_msg)).await;
+                            } else {
+                                processed_staging_count += 1;
+                            }
+
+                            if processed_staging_count >= limit {
+                                info!(
+                                    processed = processed_staging_count,
+                                    limit = limit,
+                                    "Max releases per cycle reached via prioritized staging torrents; deferring new discovery to next cycle"
+                                );
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                hash = %qbit_item.hash,
+                                name = %qbit_item.name,
+                                "Failed to resolve or adopt staging torrent from qBittorrent"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                debug!(
+                    category = %staging_category,
+                    "No existing torrents found in staging category; proceeding with normal discovery"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Could not query qBittorrent staging category; proceeding with normal pipeline"
+                );
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Stage 0.5: Prioritized Discovery for actively seeding animez-seeding series
+        // Prioritize querying Prowlarr for next episodes of series currently seeding in qBittorrent.
+        // ---------------------------------------------------------------------
+        let active_seeding = self.get_active_seeding_series().await.unwrap_or_default();
+        if !active_seeding.is_empty() {
+            info!(
+                count = active_seeding.len(),
+                "Found actively seeding series in qBittorrent animez-seeding; polling Prowlarr for next episodes"
+            );
+            for series in &active_seeding {
+                if let Err(e) = self.discover_next_episodes_for_series(series).await {
+                    debug!(
+                        error = %e,
+                        series = %series.clean_title,
+                        season = series.season,
+                        "Could not fetch next episodes for actively seeding series from Prowlarr"
+                    );
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
         // Stage 1: Poll Prowlarr and insert newly discovered items into SQLite
+        // ---------------------------------------------------------------------
         match self.discover_from_prowlarr().await {
             Ok(inserted) => {
                 info!(newly_discovered = inserted, "Discovery stage finished");
@@ -115,15 +253,35 @@ impl Pipeline {
             }
         }
 
+        // ---------------------------------------------------------------------
         // Stage 2..6: Advance actionable releases through the state machine
-        let limit = self.config.general.max_per_cycle.max(1);
+        // ---------------------------------------------------------------------
+        let remaining_limit = limit.saturating_sub(processed_staging_count).max(1);
         let db_clone = self.db.clone();
-        let actionable =
-            tokio::task::spawn_blocking(move || db_clone.get_actionable_releases(limit)).await??;
+        let mut actionable =
+            tokio::task::spawn_blocking(move || db_clone.get_actionable_releases(remaining_limit)).await??;
 
         if actionable.is_empty() {
             info!("No actionable releases pending in SQLite state machine");
             return Ok(());
+        }
+
+        // Prioritize releases that belong to actively seeding series over unknown series
+        if !active_seeding.is_empty() {
+            actionable.sort_by_key(|r| {
+                let r_parsed = r.parsed().ok();
+                let r_clean = r_parsed.as_ref().map(|p| crate::parser::normalize_title(&p.clean_title)).unwrap_or_default();
+                let r_season = r_parsed.as_ref().and_then(|p| p.season).unwrap_or(1);
+
+                let is_active_seeding = active_seeding.iter().any(|s| {
+                    let s_clean = crate::parser::normalize_title(&s.clean_title);
+                    (s_clean == r_clean || s_clean.starts_with(&r_clean) || r_clean.starts_with(&s_clean))
+                        && s.season == r_season
+                });
+
+                // Order: 0 if active seeding series (top priority), 1 otherwise
+                if is_active_seeding { 0 } else { 1 }
+            });
         }
 
         for record in actionable {
@@ -145,6 +303,113 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Looks up a staging torrent from qBittorrent in the local SQLite database by hash,
+    /// title, or normalized key. If untracked, adopts it into SQLite as an active release.
+    async fn resolve_or_adopt_staging_torrent(
+        &self,
+        qbit_item: &crate::qbittorrent::QbitTorrentInfo,
+    ) -> Result<ReleaseRecord> {
+        let hash = qbit_item.hash.clone();
+        let name = qbit_item.name.clone();
+        let parsed = crate::parser::parse_anime_release(&name);
+        let norm_key = parsed.normalized_key.clone();
+        let db_find = self.db.clone();
+
+        let existing: Option<ReleaseRecord> = tokio::task::spawn_blocking(move || -> Result<Option<ReleaseRecord>> {
+            if let Some(r) = db_find.get_release_by_source_hash(&hash)? {
+                return Ok(Some(r));
+            }
+            if let Some(r) = db_find.get_release_by_title(&name)? {
+                return Ok(Some(r));
+            }
+            if let Some(r) = db_find.get_release_by_normalized_key(&norm_key)? {
+                return Ok(Some(r));
+            }
+            Ok(None)
+        })
+        .await??;
+
+        let raw_content_path = if !qbit_item.content_path.trim().is_empty() {
+            qbit_item.content_path.clone()
+        } else {
+            PathBuf::from(&qbit_item.save_path)
+                .join(&qbit_item.name)
+                .to_string_lossy()
+                .to_string()
+        };
+        let local_content_path = self
+            .config
+            .map_qbit_path_to_local(&raw_content_path)
+            .to_string_lossy()
+            .to_string();
+
+        if let Some(mut rec) = existing {
+            let id = rec.id;
+            let db_update = self.db.clone();
+            let hash_clone = qbit_item.hash.to_ascii_lowercase();
+            let save_path_clone = qbit_item.save_path.clone();
+            let content_clone = local_content_path.clone();
+            let is_done = qbit_item.is_completed();
+            let prev_state = rec.state;
+
+            // If it was FAILED, SKIPPED, DISCOVERED, or DUPE_CHECKED, transition it to DOWNLOADING or PACKAGING
+            let new_state = match prev_state {
+                ReleaseState::Packaging | ReleaseState::Uploading | ReleaseState::Seeding => prev_state,
+                _ if is_done => ReleaseState::Packaging,
+                _ => ReleaseState::Downloading,
+            };
+
+            rec.source_info_hash = Some(hash_clone.clone());
+            rec.save_path = Some(save_path_clone.clone());
+            rec.content_path = Some(content_clone.clone());
+            rec.state = new_state;
+
+            tokio::task::spawn_blocking(move || {
+                db_update.update_staging_status(
+                    id,
+                    &hash_clone,
+                    &save_path_clone,
+                    &content_clone,
+                    new_state,
+                )
+            })
+            .await??;
+
+            return Ok(rec);
+        }
+
+        // Not tracked in DB at all: adopt it!
+        let db_adopt = self.db.clone();
+        let name_clone = qbit_item.name.clone();
+        let hash_clone = qbit_item.hash.clone();
+        let size_bytes = qbit_item.size;
+        let save_path = qbit_item.save_path.clone();
+        let content_clone = local_content_path.clone();
+        let is_done = qbit_item.is_completed();
+
+        let adopted = tokio::task::spawn_blocking(move || {
+            db_adopt.adopt_staging_torrent(
+                &name_clone,
+                &hash_clone,
+                size_bytes,
+                &save_path,
+                Some(&content_clone),
+                is_done,
+            )
+        })
+        .await??;
+
+        info!(
+            id = adopted.id,
+            title = %adopted.raw_title,
+            hash = %qbit_item.hash,
+            state = %adopted.state,
+            "Adopted untracked qBittorrent staging torrent into SQLite"
+        );
+
+        Ok(adopted)
+    }
+
     /// Advances a specific release by ID through the pipeline.
     pub async fn process_release_by_id(&self, id: i64, dry_run: bool) -> Result<()> {
         let effective_dry_run = dry_run || self.config.general.dry_run;
@@ -160,6 +425,156 @@ impl Pipeline {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Inspects torrents actively seeding in qBittorrent under `animez-seeding`
+    /// to determine which series and seasons the user is currently maintaining.
+    pub async fn get_active_seeding_series(&self) -> Result<Vec<ActiveSeedingSeries>> {
+        let seeding_cat = &self.config.qbittorrent.seeding_category;
+        let torrents = match self.qbit.list_torrents(Some(seeding_cat)).await {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    category = %seeding_cat,
+                    "Could not list torrents from qBittorrent seeding category"
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut series_map: std::collections::HashMap<(String, u32), ActiveSeedingSeries> =
+            std::collections::HashMap::new();
+
+        for t in torrents {
+            let parsed = parse_anime_release(&t.name);
+            let s = parsed.season.unwrap_or(1);
+            let ep = if let Some((_start, end)) = crate::parser::parse_batch_episode_range(&parsed.raw_title) {
+                end
+            } else {
+                parsed.episode.unwrap_or(1)
+            };
+
+            let norm_title = crate::parser::normalize_title(&parsed.clean_title);
+            let key = (norm_title, s);
+
+            series_map
+                .entry(key)
+                .and_modify(|entry| {
+                    if ep > entry.max_episode {
+                        entry.max_episode = ep;
+                    }
+                })
+                .or_insert_with(|| ActiveSeedingSeries {
+                    clean_title: parsed.clean_title.clone(),
+                    season: s,
+                    release_group: parsed.release_group.clone(),
+                    resolution: parsed.resolution.clone(),
+                    video_codec: parsed.video_codec.clone(),
+                    max_episode: ep,
+                });
+        }
+
+        Ok(series_map.into_values().collect())
+    }
+
+    /// Actively searches configured Prowlarr source indexers for next episodes of a series currently in `animez-seeding`.
+    async fn discover_next_episodes_for_series(&self, series: &ActiveSeedingSeries) -> Result<usize> {
+        let next_ep = series.max_episode + 1;
+        let group_str = series.release_group.as_deref().unwrap_or("").trim();
+        let query = if !group_str.is_empty() {
+            format!("{} {}", series.clean_title, group_str)
+        } else {
+            series.clean_title.clone()
+        };
+
+        debug!(
+            series = %series.clean_title,
+            season = series.season,
+            next_episode = next_ep,
+            query = %query,
+            "Searching Prowlarr for next episodes of actively seeding anime"
+        );
+
+        let candidates = match self.prowlarr.search_source_indexers(&query).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    query = %query,
+                    "Prowlarr search for actively seeding series returned error"
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut inserted_count = 0usize;
+        for item in candidates {
+            let parsed = parse_anime_release(&item.title);
+
+            // Must match the same season
+            if parsed.season.unwrap_or(1) != series.season {
+                continue;
+            }
+
+            // Must match clean title
+            let norm_item = crate::parser::normalize_title(&parsed.clean_title);
+            let norm_series = crate::parser::normalize_title(&series.clean_title);
+            if norm_item != norm_series && !norm_item.starts_with(&norm_series) && !norm_series.starts_with(&norm_item) {
+                continue;
+            }
+
+            // Only consider episodes >= next_ep (or batches)
+            if let Some(ep) = parsed.episode {
+                if ep < next_ep && !parsed.is_season_pack {
+                    continue;
+                }
+            }
+
+            // Check filters
+            if let Err(reason) = self.prowlarr.check_filters(&item, &parsed) {
+                debug!(
+                    title = %item.title,
+                    reason = %reason,
+                    "Skipping seeding series candidate due to filter rule"
+                );
+                continue;
+            }
+
+            // Check if already tracked in SQLite
+            let db_check = self.db.clone();
+            let guid = item.guid.clone();
+            let info_hash = item.info_hash.clone();
+            let norm_key = parsed.normalized_key.clone();
+
+            let is_dupe = tokio::task::spawn_blocking(move || {
+                db_check.is_duplicate_in_db(&guid, info_hash.as_deref(), &norm_key)
+            })
+            .await??;
+
+            if is_dupe {
+                continue;
+            }
+
+            let db_ins = self.db.clone();
+            let item_clone = item.clone();
+            let parsed_clone = parsed.clone();
+            let id = tokio::task::spawn_blocking(move || {
+                db_ins.insert_discovered(&item_clone, &parsed_clone)
+            })
+            .await??;
+
+            info!(
+                id = id,
+                title = %item.title,
+                series = %series.clean_title,
+                season = series.season,
+                "Registered next episode for actively seeding series in DISCOVERED state"
+            );
+            inserted_count += 1;
+        }
+
+        Ok(inserted_count)
     }
 
     async fn discover_from_prowlarr(&self) -> Result<usize> {
@@ -251,8 +666,48 @@ impl Pipeline {
                 return Ok(());
             }
 
-            let mal_meta = self.jikan.resolve_mal(&parsed.clean_title).await?;
-            let mal_id = mal_meta.as_ref().map(|m| m.mal_id).or(record.mal_id);
+            let mut mal_meta = None;
+            let mut mal_id = record.mal_id;
+
+            // 1. Attempt to resolve canonical MAL link from the release info_url (Nyaa page / fansub info)
+            let target_info_url = record
+                .info_url
+                .as_deref()
+                .or_else(|| {
+                    if record.guid.starts_with("http") {
+                        Some(record.guid.as_str())
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(url) = target_info_url {
+                if let Ok(links) = crate::parser::resolve_external_links_from_url(&self.http, url).await {
+                    if let Some(mid) = links.mal_id {
+                        info!(
+                            id = id,
+                            mal_id = mid,
+                            url = url,
+                            "Extracted canonical MAL ID directly from release info page"
+                        );
+                        mal_id = Some(mid);
+                        mal_meta = self.jikan.resolve_mal_by_id(mid).await.ok().flatten();
+                    }
+                }
+            }
+
+            // 2. Fall back to title-based Jikan search if MAL was not found from the info page
+            if mal_meta.is_none() {
+                if let Some(mid) = mal_id {
+                    mal_meta = self.jikan.resolve_mal_by_id(mid).await.ok().flatten();
+                }
+            }
+            if mal_meta.is_none() {
+                mal_meta = self.jikan.resolve_mal(&parsed.clean_title).await?;
+                if mal_id.is_none() {
+                    mal_id = mal_meta.as_ref().map(|m| m.mal_id);
+                }
+            }
 
             // 2. Check Ongoing Season Catch-Up Rule (AnimeZ Upload Rules Section 3)
             if let Some(catchup_reason) = self
@@ -401,6 +856,7 @@ impl Pipeline {
                 seeders: record.seeders,
                 leechers: 0,
                 publish_date: None,
+                info_url: record.info_url.clone(),
             };
 
             let hash = self.qbit.add_source_download(&disc).await?;
@@ -499,7 +955,15 @@ impl Pipeline {
                 None => self.reconstruct_bundle_from_record(&record)?,
             };
 
-            let mal_meta = self.jikan.resolve_mal(&parsed.clean_title).await?;
+            let mal_meta = if let Some(mid) = record.mal_id {
+                self.jikan.resolve_mal_by_id(mid).await.ok().flatten()
+            } else {
+                None
+            };
+            let mal_meta = match mal_meta {
+                Some(m) => Some(m),
+                None => self.jikan.resolve_mal(&parsed.clean_title).await?,
+            };
 
             // Pre-upload duplicate check right before sending the upload POST
             if !dry_run {
@@ -540,7 +1004,8 @@ impl Pipeline {
 
                                         let db_unskip = self.db.clone();
                                         let clean_title = parsed.clean_title.clone();
-                                        let _ = tokio::task::spawn_blocking(move || db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id)).await;
+                                        let season = parsed.season;
+                                        let _ = tokio::task::spawn_blocking(move || db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id, season)).await;
 
                                         info!(
                                             id = id,
@@ -655,8 +1120,9 @@ impl Pipeline {
             // Automatically un-skip any subsequent episodes for this anime that were waiting for catch-up
             let db_unskip = self.db.clone();
             let clean_title = parsed.clean_title.clone();
+            let season = parsed.season;
             let unskipped = tokio::task::spawn_blocking(move || {
-                db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id)
+                db_unskip.unskip_catchup_releases_for_anime(&clean_title, record.mal_id, season)
             })
             .await??;
 
@@ -961,6 +1427,7 @@ mod tests {
             seeders: 10,
             leechers: 1,
             publish_date: Some(Utc::now()),
+            info_url: Some("https://nyaa.si/view/3".to_string()),
         };
         let p3 = parse_anime_release(&item3.title);
         let id3 = db.insert_discovered(&item3, &p3)?;
@@ -979,6 +1446,7 @@ mod tests {
             seeders: 10,
             leechers: 1,
             publish_date: Some(Utc::now()),
+            info_url: Some("https://nyaa.si/view/3".to_string()),
         };
         let p4 = parse_anime_release(&item4.title);
         let id4 = db.insert_discovered(&item4, &p4)?;
@@ -997,6 +1465,7 @@ mod tests {
             seeders: 10,
             leechers: 1,
             publish_date: Some(Utc::now()),
+            info_url: Some("https://nyaa.si/view/3".to_string()),
         };
         let p1 = parse_anime_release(&item1.title);
         let id1 = db.insert_discovered(&item1, &p1)?;
@@ -1024,6 +1493,152 @@ mod tests {
         assert_eq!(unskipped.unwrap().id, id1);
         let rec1_rescued = db.get_release_by_id(id1)?.unwrap();
         assert_eq!(rec1_rescued.state, ReleaseState::Discovered);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_staging_priority_and_adoption() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Database::open(dir.path().join("staging_test.db"))?;
+
+        // 1. Insert a normal DISCOVERED release
+        let disc = DiscoveredRelease {
+            guid: "prowlarr-1".to_string(),
+            title: "[SubsPlease] Sousou no Frieren - 05 (1080p).mkv".to_string(),
+            indexer_id: 1,
+            indexer_name: "Nyaa".to_string(),
+            download_url: None,
+            magnet_url: None,
+            info_hash: None,
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 0,
+            publish_date: None,
+            info_url: None,
+        };
+        let p_disc = parse_anime_release(&disc.title);
+        let disc_id = db.insert_discovered(&disc, &p_disc)?;
+        assert_eq!(disc_id, 1);
+
+        // 2. Adopt an existing torrent found in animez-staging (completed)
+        let staging_hash = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let adopted = db.adopt_staging_torrent(
+            "[Erai-raws] Ranma 1/2 (2024) 3rd Season - 02 [1080p NF WEB-DL AVC AAC][MultiSub][A5DC9EE9]",
+            staging_hash,
+            500_000_000,
+            "/mnt/media/zbrr",
+            Some("/mnt/media/zbrr/[Erai-raws] Ranma 1_2 (2024) 3rd Season - 02 [1080p NF WEB-DL AVC AAC][MultiSub][A5DC9EE9].mkv"),
+            true, // is_completed -> state Packaging
+        )?;
+        assert_eq!(adopted.id, 2);
+        assert_eq!(adopted.state, ReleaseState::Packaging);
+
+        // Lookup by source hash must find it
+        let found_by_hash = db.get_release_by_source_hash(staging_hash)?;
+        assert!(found_by_hash.is_some());
+        assert_eq!(found_by_hash.unwrap().id, 2);
+
+        // Lookup by title must find it
+        let found_by_title = db.get_release_by_title(&adopted.raw_title)?;
+        assert!(found_by_title.is_some());
+        assert_eq!(found_by_title.unwrap().id, 2);
+
+        // 3. Actionable releases must prioritize the staging torrent (Packaging=2) ahead of Discovered=5
+        let actionable = db.get_actionable_releases(10)?;
+        assert_eq!(actionable.len(), 2);
+        assert_eq!(actionable[0].id, adopted.id, "Staging torrent in Packaging state must come first");
+        assert_eq!(actionable[1].id, disc_id, "Discovered release must come second");
+
+        // 4. Updating staging status
+        db.update_staging_status(
+            adopted.id,
+            staging_hash,
+            "/mnt/media/zbrr",
+            "/mnt/media/zbrr/updated.mkv",
+            ReleaseState::Uploading,
+        )?;
+        let updated = db.get_release_by_id(adopted.id)?.unwrap();
+        assert_eq!(updated.state, ReleaseState::Uploading);
+        assert_eq!(updated.content_path.as_deref(), Some("/mnt/media/zbrr/updated.mkv"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_active_seeding_series_priority() -> Result<()> {
+        let dir = tempdir()?;
+        let db = Database::open(dir.path().join("priority_test.db"))?;
+
+        // Release 1: Unknown new anime
+        let disc1 = DiscoveredRelease {
+            guid: "new-anime-1".to_string(),
+            title: "[SubsPlease] Unknown Isekai - 01 (1080p).mkv".to_string(),
+            indexer_id: 1,
+            indexer_name: "Nyaa".to_string(),
+            download_url: None,
+            magnet_url: None,
+            info_hash: None,
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 0,
+            publish_date: None,
+            info_url: None,
+        };
+        let p1 = parse_anime_release(&disc1.title);
+        let id1 = db.insert_discovered(&disc1, &p1)?;
+
+        // Release 2: Episode 3 of Ranma 1/2 (Season 3)
+        let disc2 = DiscoveredRelease {
+            guid: "ranma-s3-ep3".to_string(),
+            title: "[Erai-raws] Ranma 1/2 (2024) 3rd Season - 03 [1080p NF WEB-DL AVC AAC][MultiSub][12345678].mkv".to_string(),
+            indexer_id: 1,
+            indexer_name: "Nyaa".to_string(),
+            download_url: None,
+            magnet_url: None,
+            info_hash: None,
+            size_bytes: 1_000_000,
+            seeders: 10,
+            leechers: 0,
+            publish_date: None,
+            info_url: None,
+        };
+        let p2 = parse_anime_release(&disc2.title);
+        let id2 = db.insert_discovered(&disc2, &p2)?;
+
+        // Default actionable releases order is by ID (id1 first)
+        let mut actionable = db.get_actionable_releases(10)?;
+        assert_eq!(actionable[0].id, id1);
+        assert_eq!(actionable[1].id, id2);
+
+        // Define actively seeding series (Ranma Season 3)
+        let active_seeding = [ActiveSeedingSeries {
+            clean_title: "Ranma 1/2 (2024)".to_string(),
+            season: 3,
+            release_group: Some("Erai-raws".to_string()),
+            resolution: Some("1080p".to_string()),
+            video_codec: Some("H.264".to_string()),
+            max_episode: 2,
+        }];
+
+        // Apply active seeding prioritization
+        actionable.sort_by_key(|r| {
+            let r_parsed = r.parsed().ok();
+            let r_clean = r_parsed.as_ref().map(|p| crate::parser::normalize_title(&p.clean_title)).unwrap_or_default();
+            let r_season = r_parsed.as_ref().and_then(|p| p.season).unwrap_or(1);
+
+            let is_active_seeding = active_seeding.iter().any(|s| {
+                let s_clean = crate::parser::normalize_title(&s.clean_title);
+                (s_clean == r_clean || s_clean.starts_with(&r_clean) || r_clean.starts_with(&s_clean))
+                    && s.season == r_season
+            });
+
+            if is_active_seeding { 0 } else { 1 }
+        });
+
+        // Actively seeding series candidate (Ranma Episode 03) must now be sorted first!
+        assert_eq!(actionable[0].id, id2, "Actively seeding series next episode must be prioritized first");
+        assert_eq!(actionable[1].id, id1, "Unknown series must be second");
 
         Ok(())
     }
